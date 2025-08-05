@@ -415,8 +415,26 @@ class WebSocketServer {
 
   // Send message to specific user
   sendToUser(userId, message) {
-    // TODO: Implement user-specific messaging
-    this.logger.info(`sending message to user ${userId}:`, message);
+    try {
+      // Find all connections for this user
+      const userConnections = this.roomManager.getUserConnections(userId);
+      
+      if (userConnections && userConnections.length > 0) {
+        const messageStr = JSON.stringify(message);
+        
+        for (const connection of userConnections) {
+          if (connection.ws && connection.ws.readyState === WebSocket.OPEN) {
+            connection.ws.send(messageStr);
+          }
+        }
+        
+        this.logger.info(`sent message to user ${userId}:`, message);
+      } else {
+        this.logger.warn(`user ${userId} not found or not connected`);
+      }
+    } catch (error) {
+      this.logger.error(`error sending message to user ${userId}:`, error);
+    }
   }
 
   // Send current game state to specific user
