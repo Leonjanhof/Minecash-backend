@@ -51,7 +51,7 @@ WS_PORT=8080
 
 #### **Optional Variables:**
 ```
-CORS_ORIGIN=https://your-frontend-domain.com
+CORS_ORIGIN=https://www.minecash.org
 RATE_LIMIT_WINDOW=60000
 MAX_REQUESTS_PER_WINDOW=100
 DEBUG=false
@@ -89,7 +89,8 @@ VITE_WS_URL=wss://your-railway-app.railway.app
 
 ### **CORS Configuration**
 - Set `CORS_ORIGIN` to your frontend domain
-- Example: `https://your-app.vercel.app`
+- For Minecash: `https://www.minecash.org`
+- For development: `http://localhost:3000,https://www.minecash.org`
 
 ## 🐛 Troubleshooting
 

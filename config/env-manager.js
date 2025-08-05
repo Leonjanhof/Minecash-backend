@@ -37,7 +37,7 @@ class EnvManager {
     return {
       port: this.env.API_PORT || 3000,
       host: this.env.API_HOST || 'localhost',
-      cors: this.env.CORS_ORIGIN || '*'
+      cors: this.env.CORS_ORIGIN || 'https://www.minecash.org'
     };
   }
 
