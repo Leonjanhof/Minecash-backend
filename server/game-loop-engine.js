@@ -1046,6 +1046,64 @@ class GameLoopEngine {
         };
       }
 
+      if (action === 'auto_cashout') {
+        // Check if we're in betting or playing phase
+        if (this.crashState.phase !== 'betting' && this.crashState.phase !== 'playing') {
+          return { 
+            success: false, 
+            message: 'Auto-cashout can only be set during betting or playing phase' 
+          };
+        }
+
+        // Validate target multiplier
+        if (!targetMultiplier || targetMultiplier < 1.0) {
+          return { 
+            success: false, 
+            message: 'Invalid target multiplier. Must be at least 1.0x' 
+          };
+        }
+
+        // Check if user has an active bet
+        const { data: userBet, error: betError } = await this.supabase
+          .from('crash_bets')
+          .select('*')
+          .eq('user_id', userId)
+          .eq('round_id', this.crashState.currentRoundId)
+          .eq('status', 'active')
+          .single();
+
+        if (betError || !userBet) {
+          return { 
+            success: false, 
+            message: 'No active bet found to set auto-cashout for' 
+          };
+        }
+
+        // Set auto-cashout using database function
+        const { data: result, error: autoCashoutError } = await this.supabase.rpc('set_crash_auto_cashout', {
+          p_user_id: userId,
+          p_round_id: this.crashState.currentRoundId,
+          p_target_multiplier: targetMultiplier
+        });
+
+        if (autoCashoutError) {
+          console.error('Error setting auto-cashout:', autoCashoutError);
+          return { 
+            success: false, 
+            message: autoCashoutError.message || 'Failed to set auto-cashout' 
+          };
+        }
+
+        console.log(`auto-cashout set: ${targetMultiplier}x for user ${userId}`);
+
+        return { 
+          success: true, 
+          message: 'Auto-cashout set successfully',
+          targetMultiplier: targetMultiplier,
+          result: result
+        };
+      }
+
       return { 
         success: false, 
         message: `Unknown action: ${action}` 
