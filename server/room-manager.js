@@ -383,24 +383,6 @@ class RoomManager {
     return this.connections.get(ws);
   }
 
-  // Get all connections for a specific user
-  getUserConnections(userId) {
-    const userConnections = [];
-    
-    for (const [ws, connection] of this.connections) {
-      if (connection.userData && connection.userData.id === userId) {
-        userConnections.push({
-          ws: ws,
-          gamemode: connection.gamemode,
-          userData: connection.userData,
-          joinedAt: connection.joinedAt
-        });
-      }
-    }
-    
-    return userConnections;
-  }
-
   // Get room statistics
   getRoomStats(gamemode) {
     const room = this.rooms.get(gamemode);

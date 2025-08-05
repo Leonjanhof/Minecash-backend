@@ -1193,17 +1193,11 @@ class GameLoopEngine {
         // Send individual notifications to each user who was auto-cashed out
         if (autoCashoutResult.processed_users && global.serverInstance && global.serverInstance.wsServer) {
           for (const userCashout of autoCashoutResult.processed_users) {
-            // Validate and format the data to prevent undefined values
-            const cashoutMultiplier = parseFloat(userCashout.cashout_multiplier) || 0;
-            const cashoutAmount = parseFloat(userCashout.cashout_amount) || 0;
-            const betAmount = parseFloat(userCashout.bet_amount) || 0;
-            
             global.serverInstance.wsServer.sendToUser(userCashout.user_id, {
               type: 'auto_cashout_triggered',
-              cashoutMultiplier: cashoutMultiplier,
-              cashoutAmount: cashoutAmount,
-              betAmount: betAmount,
-              roundId: this.crashState.currentRoundId,
+              cashoutMultiplier: userCashout.cashout_multiplier,
+              cashoutAmount: userCashout.cashout_amount,
+              betAmount: userCashout.bet_amount,
               timestamp: new Date().toISOString()
             });
           }
