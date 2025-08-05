@@ -22,6 +22,9 @@ class GameLoopEngine {
     this.configReloadInterval = 300000; // 5 minutes instead of 2 minutes
     this._hasStartedReloadCycle = false; // Track if we've started the reload cycle
     
+    // Enhanced auto-cashout processing with better timing
+    this.lastAutoCashoutCheck = 0; // Track last auto-cashout check time
+    
     // Create reusable Supabase client to prevent memory leaks
     const { createClient } = require('@supabase/supabase-js');
     this.supabase = createClient(
@@ -368,29 +371,15 @@ class GameLoopEngine {
     
     const gameTiming = this.gameConfig.getGameTiming();
 
-          // Process auto-cashouts in all phases (not just playing)
-      if (this.crashState.phase === 'playing' || this.crashState.phase === 'betting') {
-        // Process auto-cashouts every 0.016 seconds (60 times per second) for maximum precision
-        if (Math.floor(timeElapsed * 60) !== Math.floor((timeElapsed - 0.016) * 60)) {
-          try {
-            // Only process auto-cashouts if we have a valid round ID
-            if (this.crashState.currentRoundId) {
-              // Process auto-cashouts silently using reusable client
-              const { data: autoCashoutResult, error: autoCashoutError } = await this.supabase.rpc('process_crash_auto_cashouts', {
-                p_round_id: this.crashState.currentRoundId,
-                p_current_multiplier: parseFloat(this.crashState.currentMultiplier)
-              });
-              
-              // Only log if there's an actual error, not for normal operation
-              if (autoCashoutError) {
-                console.error('Auto-cashout error:', autoCashoutError);
-              }
+          // Process auto-cashouts with high-frequency checks for accuracy
+          if (this.crashState.phase === 'playing') {
+            // Check every 8ms (120 FPS) for maximum accuracy
+            const now = Date.now();
+            if (now - this.lastAutoCashoutCheck >= 8) {
+              await this.processAutoCashouts();
+              this.lastAutoCashoutCheck = now;
             }
-          } catch (error) {
-            console.error('Auto-cashout processing error:', error);
           }
-        }
-      }
 
     if (this.crashState.phase === 'betting') {
       // Start game after betting phase duration from GameConfig
@@ -497,6 +486,8 @@ class GameLoopEngine {
     } catch (error) {
       await this.logger.error('error updating crash game state', { error: error.message });
     }
+    
+    // Auto-cashouts will be processed by the enhanced database function
   }
 
   // Handle crash game end
@@ -1094,7 +1085,7 @@ class GameLoopEngine {
           };
         }
 
-        console.log(`auto-cashout set: ${targetMultiplier}x for user ${userId}`);
+        console.log(`Auto-cashout set: ${targetMultiplier}x for user ${userId}`);
 
         return { 
           success: true, 
@@ -1174,6 +1165,49 @@ class GameLoopEngine {
     }
   }
 
+  // Enhanced auto-cashout processing with high-frequency checks
+  async processAutoCashouts() {
+    try {
+      // Only process if we have a valid round ID and are in playing phase
+      if (!this.crashState.currentRoundId || this.crashState.phase !== 'playing') {
+        return;
+      }
+
+      const currentMultiplier = parseFloat(this.crashState.currentMultiplier);
+      
+      // Process auto-cashouts using the enhanced database function
+      const { data: autoCashoutResult, error: autoCashoutError } = await this.supabase.rpc('process_crash_auto_cashouts', {
+        p_round_id: this.crashState.currentRoundId,
+        p_current_multiplier: currentMultiplier
+      });
+      
+      if (autoCashoutError) {
+        console.error('Auto-cashout error:', autoCashoutError);
+        return;
+      }
+      
+      // If auto-cashouts were processed, send notifications to affected users
+      if (autoCashoutResult && autoCashoutResult.processed_count > 0) {
+        console.log(`Processed ${autoCashoutResult.processed_count} auto-cashouts`);
+        
+        // Send individual notifications to each user who was auto-cashed out
+        if (autoCashoutResult.processed_users && global.serverInstance && global.serverInstance.wsServer) {
+          for (const userCashout of autoCashoutResult.processed_users) {
+            global.serverInstance.wsServer.sendToUser(userCashout.user_id, {
+              type: 'auto_cashout_triggered',
+              cashoutMultiplier: userCashout.cashout_multiplier,
+              cashoutAmount: userCashout.cashout_amount,
+              betAmount: userCashout.bet_amount,
+              timestamp: new Date().toISOString()
+            });
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Error processing auto-cashouts:', error);
+    }
+  }
+
   // Cleanup method to prevent memory leaks
   cleanup() {
     // Clear game loop intervals
@@ -1187,6 +1221,9 @@ class GameLoopEngine {
       clearInterval(this.cleanupInterval);
       this.cleanupInterval = null;
     }
+    
+    // Reset auto-cashout check time
+    this.lastAutoCashoutCheck = 0;
     
     // Clear all maps and sets to free memory
     this.games.clear();
