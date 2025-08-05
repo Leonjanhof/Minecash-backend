@@ -11,6 +11,54 @@ class RoomManager {
     this.broadcastToRoom = broadcastCallback; // Function to broadcast to a room
     this.chatManager = chatManager; // Reference to chat manager
     this.logger = new LoggingService();
+    this.cleanupInterval = null;
+    
+    // Start periodic cleanup to prevent memory leaks
+    this.startCleanupInterval();
+  }
+
+  // Start periodic cleanup interval
+  startCleanupInterval() {
+    // Clear any existing interval
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+    }
+    
+    // Run cleanup every 2 minutes
+    this.cleanupInterval = setInterval(() => {
+      this.performMemoryCleanup();
+    }, 2 * 60 * 1000);
+  }
+
+  // Perform memory cleanup
+  performMemoryCleanup() {
+    try {
+      // Clean up closed WebSocket connections
+      for (const [ws, connection] of this.connections.entries()) {
+        if (ws.readyState === 3) { // CLOSED
+          this.connections.delete(ws);
+          
+          // Remove from room if still in one
+          if (connection.gamemode && this.rooms.has(connection.gamemode)) {
+            this.rooms.get(connection.gamemode).delete(ws);
+          }
+        }
+      }
+      
+      // Clean up empty rooms
+      for (const [gamemode, room] of this.rooms.entries()) {
+        if (room.size === 0) {
+          this.rooms.delete(gamemode);
+        }
+      }
+      
+      // Log cleanup stats if maps are getting large
+      if (this.connections.size > 500 || this.rooms.size > 10) {
+        this.logger.info(`room manager cleanup completed - connections: ${this.connections.size}, rooms: ${this.rooms.size}`);
+      }
+    } catch (error) {
+      this.logger.error('error during room manager cleanup:', error);
+    }
   }
 
   // Get Supabase client using environment variables
@@ -41,8 +89,32 @@ class RoomManager {
       // Check if user is already in the requested gamemode
       const connection = this.connections.get(ws);
       if (connection && connection.gamemode === gamemode) {
+        // User is already in this gamemode, just send confirmation
+        ws.send(JSON.stringify({
+          type: 'joined_game',
+          gamemode: gamemode,
+          userData: connection.userData,
+          timestamp: new Date().toISOString()
+        }));
         return;
       }
+      
+      // Check if this WebSocket is already in the room (for reconnections)
+      const room = this.rooms.get(gamemode);
+      if (room && room.has(ws)) {
+        // WebSocket is already in the room, just send confirmation
+        const existingConnection = this.connections.get(ws);
+        if (existingConnection) {
+          ws.send(JSON.stringify({
+            type: 'joined_game',
+            gamemode: gamemode,
+            userData: existingConnection.userData,
+            timestamp: new Date().toISOString()
+          }));
+          return;
+        }
+      }
+      
       let userData = null;
       
       // Validate token with Supabase if provided
@@ -130,7 +202,6 @@ class RoomManager {
         
         if (isNewJoin) {
           this.rooms.get(gamemode).add(ws);
-          this.logger.info(`user ${userData.username} joined ${gamemode} room`);
           
           // Only broadcast user joined for new joins
           this.broadcastToRoom(gamemode, {
@@ -168,7 +239,6 @@ class RoomManager {
         }
         
         this.rooms.get(gamemode).add(ws);
-        this.logger.info(`user ${userData.username} joined ${gamemode} room`);
         
         // Broadcast user joined
         this.broadcastToRoom(gamemode, {
@@ -214,7 +284,8 @@ class RoomManager {
       // Remove from current room
       if (this.rooms.has(currentGamemode)) {
         this.rooms.get(currentGamemode).delete(ws);
-        this.logger.info(`user ${userData?.username || 'anonymous'} left ${currentGamemode} room (navigating away)`);
+        // Only log room changes for debugging, not every user action
+        // this.logger.info(`user ${userData?.username || 'anonymous'} left ${currentGamemode} room (navigating away)`);
         
         // Broadcast user left room
         if (userData) {
@@ -246,7 +317,8 @@ class RoomManager {
       
       if (gamemode && this.rooms.has(gamemode)) {
         this.rooms.get(gamemode).delete(ws);
-        this.logger.info(`user ${userData?.username || 'anonymous'} disconnected from ${gamemode}`);
+        // Only log disconnections for debugging, not every user action
+        // this.logger.info(`user ${userData?.username || 'anonymous'} disconnected from ${gamemode}`);
         
         // Broadcast user left room
         if (userData) {
@@ -346,6 +418,12 @@ class RoomManager {
   cleanup() {
     try {
       this.logger.info('cleaning up room manager...');
+      
+      // Stop cleanup interval
+      if (this.cleanupInterval) {
+        clearInterval(this.cleanupInterval);
+        this.cleanupInterval = null;
+      }
       
       // Clear all rooms
       this.rooms.clear();

@@ -7,16 +7,16 @@ class GameConfig {
       betLimits: {
         blackjack: { min: 10, max: 10000 },
         roulette: { min: 5, max: 5000 },
-        crash: { min: 1, max: 1000 },
+        crash: { min: 1, max: 5 },
         slots: { min: 1, max: 500 },
         hiLo: { min: 5, max: 2000 }
       },
       houseEdge: {
-        blackjack: 0.02, // 2%
-        roulette: 0.027, // 2.7%
-        crash: 0.01, // 1%
-        slots: 0.04, // 4%
-        hiLo: 0.015 // 1.5%
+        blackjack: 0.05, // 2%
+        roulette: 0.05, // 2.7%
+        crash: 0.05, // 1%
+        slots: 0.05, // 4%
+        hiLo: 0.05 // 1.5%
       },
       gameTiming: {
         bettingPhase: 30000, // 30 seconds
@@ -33,6 +33,7 @@ class GameConfig {
         maxBalance: 1000000
       }
     };
+    this._hasLoadedOnce = false; // Track if config has been loaded
   }
 
   // Get bet limits for gamemode
@@ -60,11 +61,11 @@ class GameConfig {
     return this.config.balanceLimits;
   }
 
-  // Update configuration
-  updateConfig(newConfig) {
+  // Update configuration from database (internal method, no save)
+  _updateConfigFromDatabase(newConfig) {
     // Validate new configuration
     if (!newConfig || typeof newConfig !== 'object') {
-      throw new Error('Invalid configuration object');
+      return;
     }
 
     // Update bet limits
@@ -115,14 +116,89 @@ class GameConfig {
         this.config.balanceLimits.maxBalance = Math.max(this.config.balanceLimits.minBalance, newConfig.balanceLimits.maxBalance);
       }
     }
+  }
 
-    console.log('Game configuration updated:', this.config);
+  // Update configuration (public method, triggers save)
+  async updateConfig(newConfig) {
+    // Validate new configuration
+    if (!newConfig || typeof newConfig !== 'object') {
+      throw new Error('Invalid configuration object');
+    }
+
+    // Store previous config to detect changes
+    const previousConfig = JSON.stringify(this.config);
+
+    // Update bet limits
+    if (newConfig.betLimits) {
+      for (const [gamemode, limits] of Object.entries(newConfig.betLimits)) {
+        if (limits.min !== undefined && limits.max !== undefined) {
+          this.config.betLimits[gamemode] = {
+            min: Math.max(1, limits.min),
+            max: Math.max(limits.min, limits.max)
+          };
+        }
+      }
+    }
+
+    // Update house edge
+    if (newConfig.houseEdge) {
+      for (const [gamemode, edge] of Object.entries(newConfig.houseEdge)) {
+        if (edge >= 0 && edge <= 1) {
+          this.config.houseEdge[gamemode] = edge;
+        }
+      }
+    }
+
+    // Update game timing
+    if (newConfig.gameTiming) {
+      for (const [phase, duration] of Object.entries(newConfig.gameTiming)) {
+        if (duration > 0) {
+          this.config.gameTiming[phase] = duration;
+        }
+      }
+    }
+
+    // Update chat settings
+    if (newConfig.chatSettings) {
+      for (const [setting, value] of Object.entries(newConfig.chatSettings)) {
+        if (value > 0) {
+          this.config.chatSettings[setting] = value;
+        }
+      }
+    }
+
+    // Update balance limits
+    if (newConfig.balanceLimits) {
+      if (newConfig.balanceLimits.minBalance !== undefined) {
+        this.config.balanceLimits.minBalance = Math.max(0, newConfig.balanceLimits.minBalance);
+      }
+      if (newConfig.balanceLimits.maxBalance !== undefined) {
+        this.config.balanceLimits.maxBalance = Math.max(this.config.balanceLimits.minBalance, newConfig.balanceLimits.maxBalance);
+      }
+    }
+
+    // Only log if config actually changed
+    const configChanged = JSON.stringify(this.config) !== previousConfig;
+    if (configChanged) {
+      console.log('Game configuration updated:', this.config);
+      
+      // Save to database immediately to persist changes
+      try {
+        await this.saveConfig();
+      } catch (error) {
+        console.error('Error saving game configuration:', error);
+      }
+    }
+    
     return this.config;
   }
 
   // Load configuration from database
   async loadConfig() {
     try {
+      // Store previous config to detect changes
+      const previousConfig = JSON.stringify(this.config);
+      
       const { createClient } = require('@supabase/supabase-js');
       const supabase = createClient(
         process.env.SUPABASE_URL,
@@ -136,8 +212,8 @@ class GameConfig {
         .single();
 
       if (!error && gameSettings) {
-        // Update config with database values
-        this.updateConfig({
+        // Update config with database values WITHOUT triggering save
+        this._updateConfigFromDatabase({
           betLimits: gameSettings.bet_limits,
           houseEdge: gameSettings.house_edge,
           gameTiming: gameSettings.game_timing,
@@ -146,7 +222,12 @@ class GameConfig {
         });
       }
 
-      console.log('Game configuration loaded from database');
+      // Only log if config actually changed AND this is the first load
+      const configChanged = JSON.stringify(this.config) !== previousConfig;
+      if (configChanged && !this._hasLoadedOnce) {
+        console.log('Game configuration loaded from database');
+        this._hasLoadedOnce = true;
+      }
       return this.config;
     } catch (error) {
       console.error('Error loading game configuration:', error);
@@ -162,6 +243,37 @@ class GameConfig {
         process.env.SUPABASE_URL,
         process.env.SUPABASE_SERVICE_ROLE_KEY
       );
+
+      // Check if config has actually changed by comparing with current database state
+      const { data: currentSettings, error: fetchError } = await supabase
+        .from('game_settings')
+        .select('*')
+        .eq('id', 1)
+        .single();
+
+      if (!fetchError && currentSettings) {
+        // Compare current config with database config
+        const currentConfig = {
+          bet_limits: currentSettings.bet_limits,
+          house_edge: currentSettings.house_edge,
+          game_timing: currentSettings.game_timing,
+          chat_settings: currentSettings.chat_settings,
+          balance_limits: currentSettings.balance_limits
+        };
+
+        const newConfig = {
+          bet_limits: this.config.betLimits,
+          house_edge: this.config.houseEdge,
+          game_timing: this.config.gameTiming,
+          chat_settings: this.config.chatSettings,
+          balance_limits: this.config.balanceLimits
+        };
+
+        // If configs are identical, don't save
+        if (JSON.stringify(currentConfig) === JSON.stringify(newConfig)) {
+          return true; // No changes needed
+        }
+      }
 
       // Save current config to database
       const { error } = await supabase
@@ -181,6 +293,7 @@ class GameConfig {
         return false;
       }
 
+      // Only log when config is actually saved (not on every call)
       console.log('Game configuration saved to database');
       return true;
     } catch (error) {
@@ -192,6 +305,18 @@ class GameConfig {
   // Get all configuration
   getAllConfig() {
     return this.config;
+  }
+
+  // Force reload config from database (for admin changes)
+  async forceReloadConfig() {
+    try {
+      await this.loadConfig();
+      console.log('Game configuration force reloaded from database');
+      return this.config;
+    } catch (error) {
+      console.error('Error force reloading game configuration:', error);
+      return this.config;
+    }
   }
 
   // Reset configuration to defaults

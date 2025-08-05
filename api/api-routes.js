@@ -472,7 +472,7 @@ router.get('/game-config', validateToken, async (req, res) => {
     
     const config = gameEngine.getAllGameConfig();
     
-    await logger.info('game config retrieved', { userId: req.userProfile.id });
+    // Removed excessive logging - only log errors
     res.json({ success: true, config });
   } catch (error) {
     await logger.error('error getting game config', { error: error.message });

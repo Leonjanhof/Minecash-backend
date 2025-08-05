@@ -63,6 +63,9 @@ class MineCashServer {
       // Start servers
       await this.startServer();
       
+      // Log successful startup
+      await this.logger.success('mineCash backend server started successfully');
+      
     } catch (error) {
       await this.logger.error('failed to initialize server', { error: error.message });
       process.exit(1);
@@ -75,7 +78,9 @@ class MineCashServer {
     
     // CORS configuration
     const corsOptions = {
-      origin: this.envManager.getApiConfig().cors,
+      origin: this.envManager.isDevelopment() 
+        ? ['http://localhost:5173', 'http://localhost:3000', 'https://www.minecash.org']
+        : this.envManager.getApiConfig().cors,
       credentials: true
     };
     this.app.use(cors(corsOptions));
@@ -88,11 +93,33 @@ class MineCashServer {
   setupRoutes() {
     // Health check endpoint
     this.app.get('/health', (req, res) => {
-      res.json({ 
+      const healthData = { 
         status: 'ok', 
         timestamp: new Date().toISOString(),
         version: '1.0.0'
-      });
+      };
+      
+      // Add memory stats if game engine is available
+      if (this.gameEngine) {
+        healthData.memory = this.gameEngine.getMemoryStats();
+      }
+      
+      res.json(healthData);
+    });
+
+    // Memory monitoring endpoint
+    this.app.get('/memory', (req, res) => {
+      if (this.gameEngine) {
+        const memoryStats = this.gameEngine.getMemoryStats();
+        console.log('Memory stats being sent:', memoryStats); // Debug log
+        res.json({
+          memory: memoryStats,
+          timestamp: new Date().toISOString()
+        });
+      } else {
+        console.log('Game engine not available for memory stats');
+        res.status(503).json({ error: 'Game engine not available' });
+      }
     });
 
     // API routes with game engine instance
@@ -134,6 +161,10 @@ class MineCashServer {
       await this.wsServer.shutdown();
     }
     
+    if (this.gameEngine) {
+      this.gameEngine.cleanup();
+    }
+    
     if (this.server) {
       this.server.close();
     }
@@ -161,6 +192,9 @@ process.on('SIGINT', () => {
 // Start the server
 const server = new MineCashServer();
 global.serverInstance = server; // Store instance globally for emergency stop
-server.initialize().catch(console.error);
+server.initialize().catch((error) => {
+  console.error('Failed to start server:', error);
+  process.exit(1);
+});
 
 module.exports = MineCashServer; 

@@ -14,6 +14,60 @@ class ChatManager {
     this.broadcastToRoom = broadcastCallback; // Function to broadcast to a room
     this.logger = new LoggingService();
     this.gameConfig = new GameConfig();
+    this.cleanupInterval = null;
+    
+    // Start periodic cleanup to prevent memory leaks
+    this.startCleanupInterval();
+  }
+
+  // Start periodic cleanup interval
+  startCleanupInterval() {
+    // Clear any existing interval
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+    }
+    
+    // Run cleanup every 3 minutes
+    this.cleanupInterval = setInterval(() => {
+      this.performMemoryCleanup();
+    }, 3 * 60 * 1000);
+  }
+
+  // Perform memory cleanup
+  performMemoryCleanup() {
+    try {
+      const now = Date.now();
+      const oneHourAgo = now - (60 * 60 * 1000); // 1 hour
+      const fiveMinutesAgo = now - (5 * 60 * 1000); // 5 minutes
+      
+      // Clean up old rate limits (older than 1 hour)
+      for (const [userId, timestamp] of this.rateLimits.entries()) {
+        if (timestamp < oneHourAgo) {
+          this.rateLimits.delete(userId);
+        }
+      }
+      
+      // Clean up old typing status (older than 5 minutes)
+      for (const [userId, typingData] of this.userTyping.entries()) {
+        if (typingData.timestamp < fiveMinutesAgo) {
+          this.userTyping.delete(userId);
+        }
+      }
+      
+      // Clean up empty chat rooms
+      for (const [gamemode, room] of this.chatRooms.entries()) {
+        if (room.users.size === 0) {
+          this.chatRooms.delete(gamemode);
+        }
+      }
+      
+      // Log cleanup stats if maps are getting large
+      if (this.rateLimits.size > 1000 || this.userTyping.size > 100) {
+        this.logger.info(`chat manager cleanup completed - rateLimits: ${this.rateLimits.size}, userTyping: ${this.userTyping.size}, chatRooms: ${this.chatRooms.size}`);
+      }
+    } catch (error) {
+      this.logger.error('error during chat manager cleanup:', error);
+    }
   }
 
   // Get Supabase admin client with service role key (bypasses RLS)
@@ -185,8 +239,13 @@ class ChatManager {
   handleUserJoin(userId, gamemode, userData) {
     this.createChatRoom(gamemode);
     const room = this.chatRooms.get(gamemode);
-    room.users.add(userId);
-    this.logger.info(`user ${userData.username} joined chat in ${gamemode}`);
+    
+    // Check if user is already in the chat room
+    if (!room.users.has(userId)) {
+      room.users.add(userId);
+      // Only log joins for debugging, not for normal operation
+      // this.logger.info(`user ${userData.username} joined chat in ${gamemode}`);
+    }
   }
 
   // Handle user leave chat
@@ -296,6 +355,12 @@ class ChatManager {
   cleanup() {
     try {
       this.logger.info('cleaning up chat manager...');
+      
+      // Stop cleanup interval
+      if (this.cleanupInterval) {
+        clearInterval(this.cleanupInterval);
+        this.cleanupInterval = null;
+      }
       
       // Clear all chat rooms
       this.chatRooms.clear();

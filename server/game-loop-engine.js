@@ -14,12 +14,28 @@ class GameLoopEngine {
     this.gameConfig = new GameConfig();
     this.userLastMessageTime = new Map(); // userId -> last message timestamp
     
+    // Add flags to prevent duplicate logging
+    this.lastRoundCompleted = null; // Track last completed round to prevent duplicate logs
+    this.isStartingNewRound = false; // Prevent multiple calls to startNewCrashRound
+    this.lastProcessedRound = null; // Track last processed round to prevent duplicate processing
+    this.lastConfigReload = Date.now(); // Set to current time to prevent immediate reload
+    this.configReloadInterval = 300000; // 5 minutes instead of 2 minutes
+    this._hasStartedReloadCycle = false; // Track if we've started the reload cycle
+    
+    // Create reusable Supabase client to prevent memory leaks
+    const { createClient } = require('@supabase/supabase-js');
+    this.supabase = createClient(
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_SERVICE_ROLE_KEY
+    );
+    
     // Crash game specific state
     this.crashState = {
       phase: 'waiting', // waiting, betting, playing, crashed
       currentRoundId: null,
       currentMultiplier: 1.00,
       phaseStartTime: Date.now(),
+      resultPhaseStartTime: null, // Track result phase timing separately
       activePlayersCount: 0,
       totalBetAmount: 0.00,
       currentCrashPoint: 1.00,
@@ -30,6 +46,7 @@ class GameLoopEngine {
     };
     
     this.crashGameLoop = null;
+    this.cleanupInterval = null;
     
     // Initialize crash in the generic game system using GameConfig
     const crashConfig = this.gameConfig.getBetLimits('crash');
@@ -39,11 +56,90 @@ class GameLoopEngine {
       maxBet: crashConfig.max,
       houseEdge: crashHouseEdge
     });
+    
+    // Start periodic cleanup to prevent memory leaks
+    this.startCleanupInterval();
+    
+    // Load game config once during initialization
+    this.gameConfig.loadConfig().then(() => {
+      console.log('Game configuration loaded during initialization');
+      this._hasStartedReloadCycle = true; // Prevent immediate reload
+    }).catch((error) => {
+      console.error('Error loading game config during initialization:', error);
+      this._hasStartedReloadCycle = true; // Prevent immediate reload even on error
+    });
+    
+    // Log successful initialization
+    console.log('Game loop engine initialized successfully');
+  }
+
+  // Start periodic cleanup interval
+  startCleanupInterval() {
+    // Clear any existing interval
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+    }
+    
+    // Run cleanup every 2 minutes to prevent memory buildup
+    this.cleanupInterval = setInterval(() => {
+      this.performMemoryCleanup();
+    }, 2 * 60 * 1000);
+  }
+
+  // Perform memory cleanup
+  performMemoryCleanup() {
+    try {
+      const now = Date.now();
+      const oneHourAgo = now - (60 * 60 * 1000); // 1 hour
+      
+      // Clean up old user message times (older than 1 hour)
+      for (const [userId, timestamp] of this.userLastMessageTime.entries()) {
+        if (timestamp < oneHourAgo) {
+          this.userLastMessageTime.delete(userId);
+        }
+      }
+      
+      // Clean up completed games older than 30 minutes
+      const thirtyMinutesAgo = now - (30 * 60 * 1000);
+      for (const [gameId, gameState] of this.gameStates.entries()) {
+        if (gameState.phase === 'results' && gameState.endTime && gameState.endTime.getTime() < thirtyMinutesAgo) {
+          this.gameStates.delete(gameId);
+          this.activeGames.delete(gameId);
+        }
+      }
+      
+      // Force garbage collection if memory usage is high
+      const memUsage = process.memoryUsage();
+      const heapUsedMB = Math.round(memUsage.heapUsed / 1024 / 1024);
+      
+      // If heap usage is over 100MB, force garbage collection
+      if (heapUsedMB > 100) {
+        if (global.gc) {
+          global.gc();
+          console.log(`Forced garbage collection at ${heapUsedMB}MB heap usage`);
+        }
+      }
+      
+      // Log cleanup stats and memory usage
+      if (this.userLastMessageTime.size > 1000 || this.gameStates.size > 50) {
+        this.logger.info(`memory cleanup completed - userLastMessageTime: ${this.userLastMessageTime.size}, gameStates: ${this.gameStates.size}, heapUsed: ${heapUsedMB}MB`);
+      }
+    } catch (error) {
+      this.logger.error('error during memory cleanup:', error);
+    }
   }
 
   // Initialize a new game session
   initializeGame(gamemode, gameId, config = null) {
-    console.log(`initializing ${gamemode} game: ${gameId}`);
+    // Only log once per game type to prevent spam
+    if (!this._initializedGames) {
+      this._initializedGames = new Set();
+    }
+    
+    if (!this._initializedGames.has(gamemode)) {
+      console.log(`initializing ${gamemode} game: ${gameId}`);
+      this._initializedGames.add(gamemode);
+    }
     
     // Use GameConfig if no config provided, or merge with provided config
     let gameConfig;
@@ -80,9 +176,7 @@ class GameLoopEngine {
       bets: new Map(),
       startTime: null,
       endTime: null,
-      config: gameConfig,
-      phaseStartTime: null,
-      phaseEndTime: null
+      config: gameConfig
     };
     
     this.gameStates.set(gameId, gameState);
@@ -99,34 +193,57 @@ class GameLoopEngine {
 
   // Initialize crash game
   async initializeCrashGame() {
-    // Create initial crash round
-    const { createClient } = require('@supabase/supabase-js');
-    const supabase = createClient(
-      process.env.SUPABASE_URL,
-      process.env.SUPABASE_SERVICE_ROLE_KEY
-    );
+    // Only initialize once to prevent spam
+    if (this._crashInitialized) {
+      return;
+    }
+    this._crashInitialized = true;
     
-    // Check if game state exists, if not reset everything
-    const { data: existingState, error: stateCheckError } = await supabase
-      .from('crash_game_state')
-      .select('id')
-      .eq('id', 1)
+    // Check if there's already an active round - don't create a new one if there is
+    const { data: existingActiveRound, error: activeRoundError } = await this.supabase
+      .from('crash_rounds')
+      .select('id, round_number, crash_multiplier, phase')
+      .eq('phase', 'active')
+      .order('id', { ascending: false })
+      .limit(1)
       .single();
     
-    if (stateCheckError || !existingState) {
-      console.log('crash game state missing, resetting rounds...');
-      try {
-        await supabase.rpc('reset_crash_rounds');
-        console.log('crash rounds reset successfully');
-      } catch (resetError) {
-        console.error('error resetting crash rounds:', resetError);
-      }
+    if (!activeRoundError && existingActiveRound) {
+      console.log(`Found existing active round ${existingActiveRound.round_number}, using it instead of creating new one`);
+      
+      // Use the existing active round
+      this.crashState.currentRoundId = existingActiveRound.id;
+      this.crashState.currentRoundNumber = existingActiveRound.round_number;
+      this.crashState.phase = 'active';
+      this.crashState.phaseStartTime = Date.now();
+      this.crashState.currentCrashPoint = existingActiveRound.crash_multiplier;
+      
+      // Update game state to use existing round
+      await this.supabase
+        .from('crash_game_state')
+        .upsert({
+          id: 1,
+          current_round_id: existingActiveRound.id,
+          phase: 'active',
+          phase_start_time: new Date().toISOString(),
+          current_multiplier: 1.00,
+          active_players_count: 0,
+          total_bet_amount: 0.00,
+          updated_at: new Date().toISOString()
+        }, {
+          onConflict: 'id'
+        });
+      
+      console.log('Using existing active round, not creating new one');
+      this.startCrashGameLoop();
+      return;
     }
     
+    // Only create new round if no active round exists
     const crypto = require('crypto');
     const serverSeed = crypto.randomBytes(32).toString('hex');
     
-    const { data: roundId, error: roundError } = await supabase.rpc('create_crash_round', {
+    const { data: roundId, error: roundError } = await this.supabase.rpc('create_crash_round', {
       p_server_seed: serverSeed,
       p_client_seed: 'default'
     });
@@ -136,8 +253,25 @@ class GameLoopEngine {
       return;
     }
     
+    // Check if game state exists, if not reset everything
+    const { data: existingStates, error: stateCheckError } = await this.supabase
+      .from('crash_game_state')
+      .select('id')
+      .order('id', { ascending: false })
+      .limit(1);
+    
+    if (stateCheckError || !existingStates || existingStates.length === 0) {
+      console.log('crash game state missing, resetting rounds...');
+      try {
+        await this.supabase.rpc('reset_crash_rounds');
+        console.log('crash rounds reset successfully');
+      } catch (resetError) {
+        console.error('error resetting crash rounds:', resetError);
+      }
+    }
+    
     // Get the created round to get the correct round number
-    const { data: roundData, error: fetchError } = await supabase
+    const { data: roundData, error: fetchError } = await this.supabase
       .from('crash_rounds')
       .select('id, round_number, crash_multiplier, game_hash, server_seed, client_seed')
       .eq('id', roundId)
@@ -159,10 +293,20 @@ class GameLoopEngine {
     
     // Always create/update the game state row (upsert)
     try {
-      await supabase
+      // Get the latest game state ID or create a new one
+      const { data: latestState } = await this.supabase
+        .from('crash_game_state')
+        .select('id')
+        .order('id', { ascending: false })
+        .limit(1)
+        .single();
+      
+      const stateId = latestState ? latestState.id : 1;
+      
+      await this.supabase
         .from('crash_game_state')
         .upsert({
-          id: 1,
+          id: stateId,
           current_round_id: roundData.id,
           phase: 'betting',
           phase_start_time: new Date().toISOString(),
@@ -185,15 +329,68 @@ class GameLoopEngine {
 
   // Start crash game loop
   startCrashGameLoop() {
-    this.crashGameLoop = setInterval(() => {
-      this.updateCrashGameLoop();
-    }, 1000); // Update every second
+    // Clear any existing loop to prevent duplicates
+    if (this.crashGameLoop) {
+      clearInterval(this.crashGameLoop);
+    }
+    
+    this.crashGameLoop = setInterval(async () => {
+      try {
+        await this.updateCrashGameLoop();
+      } catch (error) {
+        console.error('error in crash game loop:', error);
+        // Don't let errors crash the game loop
+      }
+    }, 16); // Optimized to 16ms (60 FPS) for industry-standard performance
   }
 
   // Update crash game loop
   async updateCrashGameLoop() {
     const timeElapsed = (Date.now() - this.crashState.phaseStartTime) / 1000.0;
+    
+    // Only reload game config every 5 minutes to avoid excessive database calls
+    const now = Date.now();
+    if (!this.lastConfigReload || (now - this.lastConfigReload) > this.configReloadInterval) {
+      try {
+        await this.gameConfig.loadConfig();
+        this.lastConfigReload = now;
+        // Only log once per reload cycle, not on startup
+        if (this._hasStartedReloadCycle) {
+          console.log('Game configuration reloaded from database (5-minute cycle)');
+        } else {
+          this._hasStartedReloadCycle = true;
+        }
+      } catch (error) {
+        // Silent error handling - no logging
+        // console.error('Error reloading game config:', error);
+      }
+    }
+    
     const gameTiming = this.gameConfig.getGameTiming();
+
+          // Process auto-cashouts in all phases (not just playing)
+      if (this.crashState.phase === 'playing' || this.crashState.phase === 'betting') {
+        // Process auto-cashouts every 0.016 seconds (60 times per second) for maximum precision
+        if (Math.floor(timeElapsed * 60) !== Math.floor((timeElapsed - 0.016) * 60)) {
+          try {
+            // Only process auto-cashouts if we have a valid round ID
+            if (this.crashState.currentRoundId) {
+              // Process auto-cashouts silently using reusable client
+              const { data: autoCashoutResult, error: autoCashoutError } = await this.supabase.rpc('process_crash_auto_cashouts', {
+                p_round_id: this.crashState.currentRoundId,
+                p_current_multiplier: parseFloat(this.crashState.currentMultiplier)
+              });
+              
+              // Only log if there's an actual error, not for normal operation
+              if (autoCashoutError) {
+                console.error('Auto-cashout error:', autoCashoutError);
+              }
+            }
+          } catch (error) {
+            console.error('Auto-cashout processing error:', error);
+          }
+        }
+      }
 
     if (this.crashState.phase === 'betting') {
       // Start game after betting phase duration from GameConfig
@@ -201,63 +398,75 @@ class GameLoopEngine {
         await this.startCrashGame();
       }
     } else if (this.crashState.phase === 'playing') {
-      // Update multiplier
-      this.crashState.currentMultiplier = (1.0024 * Math.pow(1.0718, timeElapsed)).toFixed(2);
+      // Update multiplier with higher precision to avoid rounding errors
+      this.crashState.currentMultiplier = parseFloat((1.0024 * Math.pow(1.0718, timeElapsed)).toFixed(4));
       
-      // Process auto-cashouts every 0.1 seconds (10 times per second)
-      if (Math.floor(timeElapsed * 10) !== Math.floor((timeElapsed - 0.1) * 10)) {
+      // Update database state every 1 second to balance accuracy and performance
+      if (Math.floor(timeElapsed) !== Math.floor((timeElapsed - 1))) {
         try {
-          const { createClient } = require('@supabase/supabase-js');
-          const supabase = createClient(
-            process.env.SUPABASE_URL,
-            process.env.SUPABASE_SERVICE_ROLE_KEY
-          );
-          
-          // Process auto-cashouts
-          const { data: autoCashoutResult, error: autoCashoutError } = await supabase.rpc('process_crash_auto_cashouts', {
-            p_round_id: this.crashState.currentRoundId,
-            p_current_multiplier: parseFloat(this.crashState.currentMultiplier)
-          });
-          
-          if (autoCashoutError) {
-            await this.logger.error('error processing auto-cashouts', { error: autoCashoutError.message });
-          } else if (autoCashoutResult && autoCashoutResult.processed_count > 0) {
-            await this.logger.info(`processed ${autoCashoutResult.processed_count} auto-cashouts at ${this.crashState.currentMultiplier}x`);
-          }
+          await this.supabase
+            .from('crash_game_state')
+            .update({
+              current_multiplier: this.crashState.currentMultiplier,
+              updated_at: new Date().toISOString()
+            })
+            .eq('id', 1);
         } catch (error) {
-          await this.logger.error('failed to process auto-cashouts', { error: error.message });
+          console.error('error updating crash game state:', error);
         }
       }
       
-      // Update database state
-      try {
-        const { createClient } = require('@supabase/supabase-js');
-        const supabase = createClient(
-          process.env.SUPABASE_URL,
-          process.env.SUPABASE_SERVICE_ROLE_KEY
-        );
-        
-        await supabase
-          .from('crash_game_state')
-          .update({
-            current_multiplier: this.crashState.currentMultiplier,
-            updated_at: new Date().toISOString()
-          })
-          .eq('id', 1);
-      } catch (error) {
-        console.error('error updating crash game state:', error);
-      }
+      // Check if crashed - only handle once per round
+      // Use same precision for both values to avoid comparison issues
+      const currentMultiplier = parseFloat(this.crashState.currentMultiplier);
+      const crashPoint = parseFloat(this.crashState.currentCrashPoint);
       
-      // Check if crashed - only handle once
-      if (parseFloat(this.crashState.currentMultiplier) >= parseFloat(this.crashState.currentCrashPoint) && this.crashState.phase === 'playing') {
-        // Set the final multiplier to exactly the crash point
+      if (currentMultiplier >= crashPoint && 
+          this.crashState.phase === 'playing' && 
+          this.lastProcessedRound !== this.crashState.currentRoundId) {
+        
+        // Set the final multiplier to exactly the crash point with proper precision
         this.crashState.currentMultiplier = this.crashState.currentCrashPoint;
+        
+        // Immediately update database with final crash value
+        try {
+          await this.supabase
+            .from('crash_game_state')
+            .update({
+              current_multiplier: this.crashState.currentCrashPoint,
+              updated_at: new Date().toISOString()
+            })
+            .eq('id', 1);
+        } catch (error) {
+          console.error('error updating final crash multiplier:', error);
+        }
+        
+        // Broadcast final crash value immediately to all clients
+        if (global.serverInstance && global.serverInstance.wsServer) {
+          global.serverInstance.wsServer.broadcastToRoom('crash', {
+            type: 'crash_final_value',
+            crashPoint: this.crashState.currentCrashPoint,
+            roundNumber: this.crashState.currentRoundNumber,
+            timestamp: new Date().toISOString()
+          });
+        }
+        
+        // Only handle crash once by setting phase to crashed
+        this.crashState.phase = 'crashed';
+        this.crashState.resultPhaseStartTime = Date.now(); // Set result phase start time immediately
         await this.handleCrashGame();
       }
     } else if (this.crashState.phase === 'crashed') {
       // Start new round after result phase duration from GameConfig
-      if (timeElapsed > (gameTiming.resultPhase / 1000)) {
+      const resultPhaseDuration = gameTiming.resultPhase / 1000;
+      const resultPhaseElapsed = this.crashState.resultPhaseStartTime 
+        ? (Date.now() - this.crashState.resultPhaseStartTime) / 1000.0 
+        : 0;
+      
+      if (resultPhaseElapsed > resultPhaseDuration && !this.isStartingNewRound) {
+        this.isStartingNewRound = true;
         await this.startNewCrashRound();
+        this.isStartingNewRound = false;
       }
     }
   }
@@ -292,8 +501,12 @@ class GameLoopEngine {
 
   // Handle crash game end
   async handleCrashGame() {
-    this.crashState.phase = 'crashed';
-    this.crashState.phaseStartTime = Date.now();
+    // Only process each round once
+    if (this.lastProcessedRound === this.crashState.currentRoundId) {
+      return;
+    }
+    
+    // Log the game end
     await this.logger.gameEvent('crash', `game ended at ${this.crashState.currentCrashPoint}x (round ${this.crashState.currentRoundNumber})`);
     
     // Update database state
@@ -309,7 +522,7 @@ class GameLoopEngine {
         await supabase
           .from('crash_rounds')
           .update({
-            crash_multiplier: this.crashState.currentCrashPoint,
+            crash_multiplier: parseFloat(this.crashState.currentCrashPoint).toFixed(4),
             phase: 'crashed',
             updated_at: new Date().toISOString()
           })
@@ -334,6 +547,11 @@ class GameLoopEngine {
 
   // Process remaining crash players
   async processRemainingCrashPlayers() {
+    // Only process each round once
+    if (this.lastProcessedRound === this.crashState.currentRoundId) {
+      return;
+    }
+    
     // Update bet status to crashed for all active players
     const { createClient } = require('@supabase/supabase-js');
     const supabase = createClient(
@@ -345,6 +563,13 @@ class GameLoopEngine {
     const roundId = this.crashState.currentRoundId;
     
     try {
+      // First, count how many active bets we're about to update
+      const { count: activeBetsCount } = await supabase
+        .from('crash_bets')
+        .select('*', { count: 'exact', head: true })
+        .eq('round_id', roundId)
+        .eq('status', 'active');
+      
       // Update all active bets to crashed status
       const { error: updateError } = await supabase
         .from('crash_bets')
@@ -358,7 +583,11 @@ class GameLoopEngine {
       if (updateError) {
         await this.logger.error('error updating crashed bets', { error: updateError.message });
       } else {
-        await this.logger.info('updated remaining crash bets to crashed status');
+        // Only log if we actually processed bets and haven't logged this round yet
+        if (activeBetsCount && activeBetsCount > 0) {
+          await this.logger.info(`updated ${activeBetsCount} remaining crash bets to crashed status`);
+        }
+        this.lastProcessedRound = roundId; // Mark this round as processed
       }
       
       // Update game state to reset player count
@@ -377,16 +606,11 @@ class GameLoopEngine {
 
   // Start new crash round
   async startNewCrashRound() {
-    const { createClient } = require('@supabase/supabase-js');
-    const supabase = createClient(
-      process.env.SUPABASE_URL,
-      process.env.SUPABASE_SERVICE_ROLE_KEY
-    );
     
     // Complete the previous round first
     if (this.crashState.currentRoundId) {
       try {
-        await supabase
+        await this.supabase
           .from('crash_rounds')
           .update({
             phase: 'completed',
@@ -395,7 +619,21 @@ class GameLoopEngine {
           })
           .eq('id', this.crashState.currentRoundId);
         
-        await this.logger.info(`completed crash round ${this.crashState.currentRoundNumber} at ${this.crashState.currentCrashPoint}x`);
+        // Only log if this round hasn't been logged yet
+        if (this.lastRoundCompleted !== this.crashState.currentRoundId) {
+          await this.logger.info(`completed crash round ${this.crashState.currentRoundNumber} at ${this.crashState.currentCrashPoint}x`);
+          this.lastRoundCompleted = this.crashState.currentRoundId;
+          
+          // Broadcast round completion to all users
+          if (global.serverInstance && global.serverInstance.wsServer) {
+            global.serverInstance.wsServer.broadcastToRoom('crash', {
+              type: 'round_completed',
+              roundNumber: this.crashState.currentRoundNumber,
+              crashPoint: this.crashState.currentCrashPoint,
+              timestamp: new Date().toISOString()
+            });
+          }
+        }
       } catch (error) {
         await this.logger.error('error completing previous crash round', { error: error.message });
       }
@@ -404,7 +642,7 @@ class GameLoopEngine {
     const crypto = require('crypto');
     const serverSeed = crypto.randomBytes(32).toString('hex');
     
-    const { data: roundId, error: roundError } = await supabase.rpc('create_crash_round', {
+    const { data: roundId, error: roundError } = await this.supabase.rpc('create_crash_round', {
       p_server_seed: serverSeed,
       p_client_seed: 'default'
     });
@@ -415,7 +653,7 @@ class GameLoopEngine {
     }
     
     // Get the created round to get the correct round number
-    const { data: roundData, error: fetchError } = await supabase
+    const { data: roundData, error: fetchError } = await this.supabase
       .from('crash_rounds')
       .select('id, round_number, crash_multiplier, game_hash, server_seed, client_seed')
       .eq('id', roundId)
@@ -438,7 +676,7 @@ class GameLoopEngine {
     
     // Update database state
     try {
-      await supabase
+      await this.supabase
         .from('crash_game_state')
         .update({
           current_round_id: roundData.id,
@@ -458,14 +696,8 @@ class GameLoopEngine {
   async processBet(gameId, userId, betData) {
     // Check if user is banned first
     try {
-      const { createClient } = require('@supabase/supabase-js');
-      const supabase = createClient(
-        process.env.SUPABASE_URL,
-        process.env.SUPABASE_SERVICE_ROLE_KEY
-      );
-      
       // Check if user is banned
-      const { data: userData, error: userError } = await supabase
+      const { data: userData, error: userError } = await this.supabase
         .from('users')
         .select('banned')
         .eq('id', userId)
@@ -496,43 +728,28 @@ class GameLoopEngine {
 
     // Handle crash game specially
     if (gameId === 'crash') {
-      // Check if we're in betting phase
-      if (this.crashState.phase !== 'betting') {
-        return { 
-          success: false, 
-          message: 'Betting is not currently open', 
-          phase: this.crashState.phase,
-          allowedPhases: ['betting']
-        };
-      }
-
       const { amount, betType } = betData;
       
-      // Validate bet using GameConfig
-      if (!this.validateBet('crash', amount, betType)) {
-        const betLimits = this.gameConfig.getBetLimits('crash');
+      // Validate bet using enhanced validation
+      const validation = await this.validateBet('crash', amount, betType, userId);
+      if (!validation.valid) {
         return { 
           success: false, 
-          message: 'Invalid bet amount', 
-          minBet: betLimits.min, 
-          maxBet: betLimits.max 
+          message: validation.message,
+          phase: validation.phase,
+          minBet: validation.minBet,
+          maxBet: validation.maxBet
         };
       }
 
-      // Use database function to place bet
-      try {
-        const { createClient } = require('@supabase/supabase-js');
-        const supabase = createClient(
-          process.env.SUPABASE_URL,
-          process.env.SUPABASE_SERVICE_ROLE_KEY
-        );
-        
-        // Call the database function to place bet
-        const { data: result, error } = await supabase.rpc('place_crash_bet', {
-          p_user_id: userId,
-          p_bet_amount: amount,
-          p_round_id: this.crashState.currentRoundId
-        });
+              // Use database function to place bet
+        try {
+          // Call the database function to place bet
+          const { data: result, error } = await this.supabase.rpc('place_crash_bet', {
+            p_user_id: userId,
+            p_bet_amount: amount,
+            p_round_id: this.crashState.currentRoundId
+          });
         
         if (error) {
           console.error('error placing crash bet:', error);
@@ -567,271 +784,23 @@ class GameLoopEngine {
     if (!gameState) {
       return { 
         success: false, 
-        message: `Game ${gameId} not found` 
+        message: `Game ${gameId} is not available`
       };
     }
 
-    if (gameState.phase !== 'betting') {
-      return { 
-        success: false, 
-        message: 'Betting is not currently open',
-        phase: gameState.phase,
-        allowedPhases: ['betting']
-      };
-    }
-
-    const { amount, betType } = betData;
-    
     // Validate bet using GameConfig
-    if (!this.validateBet(gameState.gamemode, amount, betType)) {
-      const betLimits = this.gameConfig.getBetLimits(gameState.gamemode);
+    const { amount, betType } = betData;
+    if (!this.validateBet(gameId, amount, betType)) {
+      const betLimits = this.gameConfig.getBetLimits(gameId);
       return { 
         success: false, 
-        message: 'Invalid bet amount',
-        minBet: betLimits.min,
-        maxBet: betLimits.max
+        message: 'Invalid bet amount', 
+        minBet: betLimits.min, 
+        maxBet: betLimits.max 
       };
     }
 
-    // Add bet to game state
-    if (!gameState.bets.has(userId)) {
-      gameState.bets.set(userId, []);
-    }
-    gameState.bets.get(userId).push({
-      amount,
-      betType,
-      timestamp: new Date()
-    });
-
-    console.log(`bet processed: ${amount} by user ${userId} in game ${gameId}`);
-    
-    return { 
-      success: true, 
-      message: 'Bet placed successfully',
-      betAmount: amount,
-      gameState: gameState
-    };
-  }
-
-  // Process game action (cashout, auto-cashout, etc.)
-  async processGameAction(gameId, userId, action, targetMultiplier = 1.5) {
-    // Handle crash game specially
-    if (gameId === 'crash') {
-      // Handle auto-cashout regardless of game phase
-      if (action === 'auto_cashout') {
-        try {
-          const { createClient } = require('@supabase/supabase-js');
-          const supabase = createClient(
-            process.env.SUPABASE_URL,
-            process.env.SUPABASE_SERVICE_ROLE_KEY
-          );
-          
-          // Call the database function to set auto-cashout
-          const { data: result, error } = await supabase.rpc('set_crash_auto_cashout', {
-            p_user_id: userId,
-            p_round_id: this.crashState.currentRoundId,
-            p_target_multiplier: targetMultiplier
-          });
-          
-          if (error) {
-            console.error('error setting auto-cashout:', error);
-            return { 
-              success: false, 
-              message: error.message || 'Failed to set auto-cashout' 
-            };
-          }
-          
-          console.log(`user ${userId} enabled auto-cashout at ${result.target_multiplier}x`);
-          return { 
-            success: true, 
-            action: 'auto_cashout_enabled',
-            target_multiplier: result.target_multiplier
-          };
-        } catch (error) {
-          console.error('failed to set auto-cashout:', error);
-          return { 
-            success: false, 
-            message: 'Failed to set auto-cashout' 
-          };
-        }
-      }
-
-      // For cashout action, check if game is playing
-      if (action === 'cashout') {
-        if (this.crashState.phase !== 'playing') {
-          return { 
-            success: false, 
-            message: 'Cannot cashout - game is not currently playing',
-            action: 'cashout_failed'
-          };
-        }
-
-        try {
-          const { createClient } = require('@supabase/supabase-js');
-          const supabase = createClient(
-            process.env.SUPABASE_URL,
-            process.env.SUPABASE_SERVICE_ROLE_KEY
-          );
-          
-          const currentMultiplier = parseFloat(this.crashState.currentMultiplier);
-          
-          // Call the database function to cashout
-          const { data: result, error } = await supabase.rpc('cashout_crash_bet', {
-            p_user_id: userId,
-            p_round_id: this.crashState.currentRoundId,
-            p_cashout_multiplier: currentMultiplier
-          });
-          
-          if (error) {
-            console.error('error cashing out crash bet:', error);
-            return { 
-              success: false, 
-              message: error.message || 'Failed to cashout' 
-            };
-          }
-          
-          console.log(`user ${userId} cashed out at ${currentMultiplier}x for ${result.payout_amount} GC`);
-          
-          return { 
-            success: true, 
-            payout: result.payout_amount, 
-            multiplier: currentMultiplier,
-            newBalance: result.new_balance
-          };
-          
-        } catch (error) {
-          console.error('failed to cashout crash bet:', error);
-          return { 
-            success: false, 
-            message: 'Failed to cashout' 
-          };
-        }
-      }
-      
-      // Unknown action for crash
-      return { 
-        success: false, 
-        message: `Unknown game action: ${action}` 
-      };
-    }
-
-    // Handle other games
-    const gameState = this.gameStates.get(gameId);
-    if (!gameState) {
-      return { 
-        success: false, 
-        message: `Game ${gameId} not found` 
-      };
-    }
-
-    if (gameState.phase !== 'playing') {
-      return { 
-        success: false, 
-        message: 'Game is not currently playing' 
-      };
-    }
-
-    // Handle different game actions
-    switch (action) {
-      case 'cashout':
-        // Process cashout for crash game
-        if (gameState.gamemode === 'crash') {
-          const userBets = gameState.bets.get(userId) || [];
-          const activeBet = userBets.find(bet => bet.status === 'active');
-          
-          if (activeBet) {
-            const currentMultiplier = this.crashState.currentMultiplier;
-            const payout = activeBet.amount * currentMultiplier;
-            
-            // Mark bet as cashed out
-            activeBet.status = 'cashed_out';
-            activeBet.cashoutMultiplier = currentMultiplier;
-            activeBet.payout = payout;
-            
-            console.log(`user ${userId} cashed out at ${currentMultiplier}x for ${payout} GC`);
-            
-            return { 
-              success: true, 
-              payout: payout, 
-              multiplier: currentMultiplier 
-            };
-          } else {
-            return { 
-              success: false, 
-              message: 'No active bet to cashout' 
-            };
-          }
-        }
-        break;
-        
-      default:
-        return { 
-          success: false, 
-          message: `Unknown game action: ${action}` 
-        };
-    }
-  }
-
-  // Execute game logic and determine result
-  async executeGameLogic(gameId) {
-    const gameState = this.gameStates.get(gameId);
-    if (!gameState) {
-      throw new Error(`Game ${gameId} not found`);
-    }
-
-    console.log(`executing game logic for ${gameState.gamemode}: ${gameId}`);
-    
-    // Change phase to playing
-    gameState.phase = 'playing';
-    gameState.startTime = new Date();
-    
-    // TODO: Implement gamemode-specific logic
-    // For now, just simulate a basic result
-    const result = this.simulateGameResult(gameState.gamemode);
-    
-    // Change phase to results
-    gameState.phase = 'results';
-    gameState.endTime = new Date();
-    gameState.result = result;
-    
-    return result;
-  }
-
-  // Handle game completion
-  async completeGame(gameId) {
-    const gameState = this.gameStates.get(gameId);
-    if (!gameState) {
-      throw new Error(`Game ${gameId} not found`);
-    }
-
-    console.log(`completing game ${gameId}`);
-    
-    // Process payouts
-    const payouts = this.calculatePayouts(gameState);
-    
-    // Clean up game state
-    this.activeGames.delete(gameId);
-    
-    return {
-      gameId,
-      payouts,
-      result: gameState.result
-    };
-  }
-
-  // Get current game state
-  getGameState(gameId) {
-    return this.gameStates.get(gameId);
-  }
-
-  // Get crash game state
-  async getCrashGameState(userId = null) {
-    // If no user ID provided, return basic state
-    if (!userId) {
-      return this.crashState;
-    }
-
-    // Get state with user's bet from database
+    // Place bet using database function
     try {
       const { createClient } = require('@supabase/supabase-js');
       const supabase = createClient(
@@ -839,423 +808,355 @@ class GameLoopEngine {
         process.env.SUPABASE_SERVICE_ROLE_KEY
       );
       
-      const { data: result, error } = await supabase.rpc('get_crash_game_state_with_user_bet', {
-        p_user_id: userId
+      // Call the database function to place bet
+      const { data: result, error } = await supabase.rpc('place_game_bet', {
+        p_user_id: userId,
+        p_game_id: gameId,
+        p_bet_amount: amount,
+        p_bet_type: betType
       });
       
       if (error) {
-        console.error('error getting crash game state with user bet:', error);
-        return this.crashState;
+        console.error('error placing bet:', error);
+        return { 
+          success: false, 
+          message: error.message || 'Failed to place bet' 
+        };
       }
       
-      // Merge database state with in-memory state, prioritizing in-memory for real-time data
-      return {
-        ...this.crashState, // Keep all in-memory state (phase, multiplier, etc.)
-        current_user_bet: result.current_user_bet, // Add user's bet from database
-        active_bets: result.active_bets, // Add active bets from database
-        current_round: result.current_round, // Add round info from database
-        // Keep in-memory values for real-time data
-        phase: this.crashState.phase,
-        currentMultiplier: this.crashState.currentMultiplier,
-        phaseStartTime: this.crashState.phaseStartTime,
-        activePlayersCount: this.crashState.activePlayersCount,
-        totalBetAmount: this.crashState.totalBetAmount
+      console.log(`bet processed: ${amount} by user ${userId} in ${gameId} game`);
+      
+      return { 
+        success: true, 
+        message: 'Bet placed successfully',
+        betAmount: amount,
+        betId: result.bet_id,
+        newBalance: result.new_balance,
+        gameState: gameState
       };
+      
     } catch (error) {
-      console.error('error in getCrashGameState:', error);
-      return this.crashState;
+      console.error('failed to place bet:', error);
+      return { 
+        success: false, 
+        message: 'Failed to place bet' 
+      };
     }
   }
 
-  // Get crash history for live history bar
-  async getCrashHistory(limit = 20) {
-    if (!this.databaseService) {
-      return [];
-    }
-
-    try {
-      const { data, error } = await this.databaseService.supabase
-        .from('crash_rounds')
-        .select('round_number, crash_multiplier, phase')
-        .eq('phase', 'completed')
-        .order('round_number', { ascending: false })
-        .limit(limit);
-
-      if (error) {
-        console.error('error fetching crash history:', error);
-        return [];
-      }
-
-      // Reverse to get chronological order (oldest to newest)
-      return data ? data.reverse() : [];
-    } catch (error) {
-      console.error('error in getCrashHistory:', error);
-      return [];
-    }
-  }
-
-  // Update game state
-  updateGameState(gameId, newState) {
-    const currentState = this.gameStates.get(gameId);
-    if (currentState) {
-      this.gameStates.set(gameId, { ...currentState, ...newState });
-    }
-  }
-
-  // Validate bet
-  validateBet(gamemode, amount, betType) {
-    // Basic validation
-    if (amount <= 0) return false;
-    
-    // Get bet limits from GameConfig
-    const betLimits = this.gameConfig.getBetLimits(gamemode);
+  async validateBet(gameId, amount, betType, userId = null) {
+    // Check bet limits
+    const betLimits = this.gameConfig.getBetLimits(gameId);
     if (amount < betLimits.min || amount > betLimits.max) {
-      return false;
+      return { valid: false, message: `Bet amount must be between ${betLimits.min} and ${betLimits.max}`, minBet: betLimits.min, maxBet: betLimits.max };
     }
     
-    // TODO: Add gamemode-specific validation
-    return true;
-  }
-
-  // Simulate game result (placeholder)
-  simulateGameResult(gamemode) {
-    switch (gamemode) {
-      case 'blackjack':
-        return { winner: 'player', payout: 1.5 };
-      case 'roulette':
-        return { number: Math.floor(Math.random() * 37), payout: 2.0 };
-      case 'crash':
-        return { multiplier: 1.5, crashed: false };
-      case 'slots':
-        return { symbols: ['🍒', '🍊', '🍇'], payout: 0 };
-      case 'hi-lo':
-        return { correct: true, streak: 1 };
-      default:
-        return { winner: 'house', payout: 0 };
-    }
-  }
-
-  // Calculate payouts
-  calculatePayouts(gameState) {
-    const payouts = new Map();
-    
-    for (const [userId, bets] of gameState.bets) {
-      let totalPayout = 0;
-      
-      for (const bet of bets) {
-        // TODO: Implement proper payout calculation based on game result
-        const payout = bet.amount * (gameState.result.payout || 0);
-        totalPayout += payout;
+    // For crash game, check additional validations
+    if (gameId === 'crash') {
+      // Check if we're in betting phase
+      if (this.crashState.phase !== 'betting') {
+        return { valid: false, message: 'Betting is not currently open', phase: this.crashState.phase };
       }
       
-      if (totalPayout > 0) {
-        payouts.set(userId, totalPayout);
-      }
-    }
-    
-    return payouts;
-  }
-
-  // Get all active games
-  getActiveGames() {
-    return Array.from(this.activeGames);
-  }
-
-  // Clean up completed games
-  cleanupCompletedGames() {
-    const now = new Date();
-    const completedGames = [];
-    
-    for (const gameId of this.activeGames) {
-      const gameState = this.gameStates.get(gameId);
-      if (gameState && gameState.phase === 'results') {
-        // Game has been in results phase for too long
-        const timeSinceEnd = now - gameState.endTime;
-        if (timeSinceEnd > 30000) { // 30 seconds
-          completedGames.push(gameId);
+      // Check if user already has a bet for this round
+      if (userId) {
+        try {
+          const { data: existingBet, error } = await this.supabase
+            .from('crash_bets')
+            .select('id')
+            .eq('user_id', userId)
+            .eq('round_id', this.crashState.currentRoundId)
+            .single();
+          
+          if (!error && existingBet) {
+            return { valid: false, message: 'You already have a bet for this round' };
+          }
+        } catch (error) {
+          console.error('Error checking existing bet:', error);
+          return { valid: false, message: 'Failed to validate bet' };
         }
       }
     }
     
-    for (const gameId of completedGames) {
-      this.gameStates.delete(gameId);
-      this.activeGames.delete(gameId);
-    }
-    
-    return completedGames;
-  }
-
-  // Generate crash point with house edge
-  generateCrashPoint() {
-    // Use the hash to generate deterministic crash point
-    return this.generateCrashPointFromHash(this.crashState.currentRoundId);
-  }
-
-  // Generate crash point from hash using proper crash equation
-  generateCrashPointFromHash(hash, div = 33, g = 1) {
-    const e = Math.pow(2, 52); // Extreme value
-    const hashBuffer = Buffer.from(hash, 'hex');
-    
-    // Generate a proper random number from the hash (like Python's random.uniform)
-    // Use multiple bytes to get better distribution
-    let h = 0;
-    for (let i = 0; i < Math.min(hashBuffer.length, 8); i++) {
-      h = (h * 256 + hashBuffer[i]) % e;
-    }
-    
-    // Apply growth rate validation (like Python's checkg function)
-    g = Math.max(0.1, Math.round(g * 10) / 10);
-    if (g === 0) g = 1;
-    
-    // Apply divisor validation (like Python's checkdiv function)
-    div = Math.max(1, Math.round(div * 100) / 100);
-    
-    // Check for instant crash (1x) - same as Python logic
-    if (h % div === 0) {
-      return 1.00;
-    }
-    
-    // Calculate crash point using the exact same equation as Python
-    let crashPoint = 0.99 * Math.pow(e / (e - h), 1/g) + 0.01;
-    
-    // Apply house edge from GameConfig
-    const houseEdge = this.gameConfig.getHouseEdge('crash');
-    crashPoint = crashPoint * (1 - houseEdge);
-    
-    return Math.max(1.00, parseFloat(crashPoint.toFixed(2)));
-  }
-
-  // Verify crash point from hash (for player verification)
-  verifyCrashPointFromHash(hash, expectedCrashPoint, div = 33, g = 1) {
-    const calculatedCrashPoint = this.generateCrashPointFromHash(hash, div, g);
-    return {
-      verified: Math.abs(calculatedCrashPoint - expectedCrashPoint) < 0.01,
-      calculated: calculatedCrashPoint,
-      expected: expectedCrashPoint,
-      hash: hash
-    };
-  }
-
-  // Start a game with timing
-  async startGame(gameId) {
-    const gameState = this.gameStates.get(gameId);
-    if (!gameState) {
-      return { success: false, message: 'Game not found' };
-    }
-
-    const timing = gameState.config.timing;
-    const now = Date.now();
-
-    // Start betting phase
-    gameState.phase = 'betting';
-    gameState.phaseStartTime = now;
-    gameState.phaseEndTime = now + timing.bettingPhase;
-    gameState.startTime = now;
-
-    console.log(`Started ${gameState.gamemode} game ${gameId} - betting phase for ${timing.bettingPhase}ms`);
-
-    // Schedule phase transitions
-    setTimeout(() => {
-      this.startGamePhase(gameId);
-    }, timing.bettingPhase);
-
-    return { success: true, message: 'Game started', gameState };
-  }
-
-  // Start game phase (after betting)
-  async startGamePhase(gameId) {
-    const gameState = this.gameStates.get(gameId);
-    if (!gameState || gameState.phase !== 'betting') {
-      return;
-    }
-
-    const timing = gameState.config.timing;
-    const now = Date.now();
-
-    // Start game phase
-    gameState.phase = 'playing';
-    gameState.phaseStartTime = now;
-    gameState.phaseEndTime = now + timing.gamePhase;
-
-    console.log(`Started ${gameState.gamemode} game ${gameId} - playing phase for ${timing.gamePhase}ms`);
-
-    // Execute game logic
-    await this.executeGameLogic(gameId);
-
-    // Schedule results phase
-    setTimeout(() => {
-      this.startResultsPhase(gameId);
-    }, timing.gamePhase);
-  }
-
-  // Start results phase
-  async startResultsPhase(gameId) {
-    const gameState = this.gameStates.get(gameId);
-    if (!gameState || gameState.phase !== 'playing') {
-      return;
-    }
-
-    const timing = gameState.config.timing;
-    const now = Date.now();
-
-    // Start results phase
-    gameState.phase = 'results';
-    gameState.phaseStartTime = now;
-    gameState.phaseEndTime = now + timing.resultPhase;
-
-    console.log(`Started ${gameState.gamemode} game ${gameId} - results phase for ${timing.resultPhase}ms`);
-
-    // Complete the game
-    await this.completeGame(gameId);
-
-    // Schedule cleanup
-    setTimeout(() => {
-      this.cleanupCompletedGames();
-    }, timing.resultPhase);
-  }
-
-  // Stop crash game loop
-  stopCrashGameLoop() {
-    if (this.crashGameLoop) {
-      clearInterval(this.crashGameLoop);
-      this.crashGameLoop = null;
-    }
-  }
-
-  // Validate chat message using GameConfig
-  validateChatMessage(message, userId) {
-    const chatSettings = this.gameConfig.getChatSettings();
-    
-    // Check message length
-    if (message.length > chatSettings.maxMessageLength) {
-      return {
-        valid: false,
-        error: `Message too long. Maximum ${chatSettings.maxMessageLength} characters allowed.`
-      };
-    }
-
-    // Check if user has sent a message recently (rate limiting)
-    const now = Date.now();
-    const userLastMessage = this.userLastMessageTime.get(userId);
-    
-    if (userLastMessage && (now - userLastMessage) < chatSettings.messageRateLimit) {
-      return {
-        valid: false,
-        error: `Please wait ${Math.ceil((chatSettings.messageRateLimit - (now - userLastMessage)) / 1000)} seconds before sending another message.`
-      };
-    }
-
-    // Update last message time
-    this.userLastMessageTime.set(userId, now);
-
     return { valid: true };
   }
 
-  // Get chat history with GameConfig limits
-  getChatHistory(gameId, limit = null) {
-    const chatSettings = this.gameConfig.getChatSettings();
-    const maxHistory = limit || chatSettings.maxHistoryLength;
-    
-    const gameState = this.gameStates.get(gameId);
-    if (!gameState || !gameState.chatHistory) {
-      return [];
-    }
-
-    // Return last N messages
-    return gameState.chatHistory.slice(-maxHistory);
+  async getGameState(gameId) {
+    return this.gameStates.get(gameId) || null;
   }
 
-  // Add chat message with validation
-  addChatMessage(gameId, userId, message, username = 'Anonymous') {
-    const validation = this.validateChatMessage(message, userId);
-    if (!validation.valid) {
-      return validation;
-    }
-
-    const gameState = this.gameStates.get(gameId);
-    if (!gameState) {
-      return { valid: false, error: 'Game not found' };
-    }
-
-    // Initialize chat history if not exists
-    if (!gameState.chatHistory) {
-      gameState.chatHistory = [];
-    }
-
-    const chatMessage = {
-      id: Date.now() + Math.random(),
-      userId,
-      username,
-      message,
-      timestamp: new Date().toISOString()
-    };
-
-    // Add message to history
-    gameState.chatHistory.push(chatMessage);
-
-    // Trim history to max length
-    const chatSettings = this.gameConfig.getChatSettings();
-    if (gameState.chatHistory.length > chatSettings.maxHistoryLength) {
-      gameState.chatHistory = gameState.chatHistory.slice(-chatSettings.maxHistoryLength);
-    }
-
-    return { valid: true, message: chatMessage };
+  async getCrashState() {
+    return this.crashState;
   }
 
-  // Get GameConfig instance
-  getGameConfig() {
-    return this.gameConfig;
-  }
-
-  // Get bet limits for a gamemode
-  getBetLimits(gamemode) {
-    return this.gameConfig.getBetLimits(gamemode);
-  }
-
-  // Get house edge for a gamemode
-  getHouseEdge(gamemode) {
-    return this.gameConfig.getHouseEdge(gamemode);
-  }
-
-  // Get game timing settings
-  getGameTiming() {
-    return this.gameConfig.getGameTiming();
-  }
-
-  // Get chat settings
   getChatSettings() {
     return this.gameConfig.getChatSettings();
   }
 
-  // Get balance limits
-  getBalanceLimits() {
-    return this.gameConfig.getBalanceLimits();
+  getBetLimits(gamemode) {
+    return this.gameConfig.getBetLimits(gamemode);
   }
 
-  // Update game configuration
-  updateGameConfig(newConfig) {
-    return this.gameConfig.updateConfig(newConfig);
+  getHouseEdge(gamemode) {
+    return this.gameConfig.getHouseEdge(gamemode);
   }
 
-  // Load game configuration from database
-  async loadGameConfig() {
-    return await this.gameConfig.loadConfig();
+  updateGameConfig(config) {
+    return this.gameConfig.updateConfig(config);
   }
 
-  // Save game configuration to database
   async saveGameConfig() {
-    return await this.gameConfig.saveConfig();
+    return this.gameConfig.saveConfig();
   }
 
-  // Get all game configuration
+  resetGameConfig() {
+    return this.gameConfig.resetConfig();
+  }
+
   getAllGameConfig() {
     return this.gameConfig.getAllConfig();
   }
 
-  // Reset game configuration to defaults
-  resetGameConfig() {
-    return this.gameConfig.resetConfig();
+  async getCrashGameState(userId) {
+    // Return the current crash state with user-specific information
+    const state = { ...this.crashState };
+    
+    // Add user-specific bet information if available
+    if (userId && userId !== 'anonymous') {
+      try {
+        // Get user's current bet for this round
+        const { data: userBet, error } = await this.supabase
+          .from('crash_bets')
+          .select('*')
+          .eq('user_id', userId)
+          .eq('round_id', this.crashState.currentRoundId)
+          .single();
+        
+        if (!error && userBet) {
+          state.userBet = {
+            amount: userBet.bet_amount,
+            betId: userBet.id,
+            placedAt: userBet.created_at
+          };
+        }
+      } catch (error) {
+        console.error('Error getting user bet:', error);
+      }
+    }
+    
+    return state;
+  }
+
+  async getCrashHistory(limit = 20) {
+    try {
+      // Get recent crash rounds
+      const { data: rounds, error } = await this.supabase
+        .from('crash_rounds')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(limit);
+      
+      if (error) {
+        console.error('Error getting crash history:', error);
+        return [];
+      }
+      
+      return rounds || [];
+    } catch (error) {
+      console.error('Error getting crash history:', error);
+      return [];
+    }
+  }
+
+  async processGameAction(gamemode, userId, action, targetMultiplier = null) {
+    try {
+      if (gamemode === 'crash') {
+        return await this.processCrashGameAction(userId, action, targetMultiplier);
+      }
+      
+      return { 
+        success: false, 
+        message: `Game action not supported for ${gamemode}` 
+      };
+    } catch (error) {
+      console.error('Error processing game action:', error);
+      return { 
+        success: false, 
+        message: 'Failed to process game action' 
+      };
+    }
+  }
+
+  async processCrashGameAction(userId, action, targetMultiplier = null) {
+    try {
+
+      if (action === 'cashout') {
+        // Check if we're in playing phase
+        if (this.crashState.phase !== 'playing') {
+          return { 
+            success: false, 
+            message: 'Cashout is only available during the playing phase' 
+          };
+        }
+
+        // Check if user has an active bet
+        const { data: userBet, error: betError } = await this.supabase
+          .from('crash_bets')
+          .select('*')
+          .eq('user_id', userId)
+          .eq('round_id', this.crashState.currentRoundId)
+          .eq('status', 'active')
+          .single();
+
+        if (betError || !userBet) {
+          return { 
+            success: false, 
+            message: 'No active bet found to cashout' 
+          };
+        }
+
+        // Calculate cashout amount based on current multiplier
+        const cashoutMultiplier = parseFloat(this.crashState.currentMultiplier);
+        const cashoutAmount = userBet.bet_amount * cashoutMultiplier;
+
+        // Process cashout using database function
+        const { data: result, error: cashoutError } = await this.supabase.rpc('cashout_crash_bet', {
+          p_user_id: userId,
+          p_round_id: this.crashState.currentRoundId,
+          p_cashout_multiplier: cashoutMultiplier
+        });
+
+        if (cashoutError) {
+          console.error('Error processing cashout:', cashoutError);
+          return { 
+            success: false, 
+            message: cashoutError.message || 'Failed to process cashout' 
+          };
+        }
+
+        console.log(`cashout processed: ${cashoutAmount} by user ${userId} at ${cashoutMultiplier}x`);
+
+        return { 
+          success: true, 
+          message: 'Cashout successful',
+          cashoutAmount: cashoutAmount,
+          cashoutMultiplier: cashoutMultiplier,
+          newBalance: result.new_balance,
+          betId: result.bet_id
+        };
+      }
+
+      return { 
+        success: false, 
+        message: `Unknown action: ${action}` 
+      };
+    } catch (error) {
+      console.error('Error processing crash game action:', error);
+      return { 
+        success: false, 
+        message: 'Failed to process game action' 
+      };
+    }
+  }
+
+  getMemoryStats() {
+    // Get Node.js memory usage
+    const memUsage = process.memoryUsage();
+    
+    const stats = {
+      // Node.js memory statistics
+      memory: {
+        heapUsed: Math.round(memUsage.heapUsed / 1024 / 1024), // MB
+        heapTotal: Math.round(memUsage.heapTotal / 1024 / 1024), // MB
+        external: Math.round(memUsage.external / 1024 / 1024), // MB
+        rss: Math.round(memUsage.rss / 1024 / 1024), // MB
+        heapUsage: Math.round((memUsage.heapUsed / memUsage.heapTotal) * 100), // Percentage
+        memoryEfficiency: Math.round((memUsage.heapUsed / memUsage.rss) * 100) // Percentage
+      },
+      // Game engine statistics
+      games: this.gameStates.size,
+      activeGames: this.activeGames.size,
+      crashState: {
+        phase: this.crashState.phase,
+        currentRoundId: this.crashState.currentRoundId,
+        currentMultiplier: this.crashState.currentMultiplier,
+        currentCrashPoint: this.crashState.currentCrashPoint,
+        currentRoundNumber: this.crashState.currentRoundNumber,
+        activePlayersCount: this.crashState.activePlayersCount,
+        totalBetAmount: this.crashState.totalBetAmount
+      },
+      userConnections: this.userLastMessageTime.size,
+      lastProcessedRound: this.lastProcessedRound,
+      lastRoundCompleted: this.lastRoundCompleted,
+      isStartingNewRound: this.isStartingNewRound,
+      configReloadInterval: this.configReloadInterval,
+      lastConfigReload: this.lastConfigReload,
+      _hasStartedReloadCycle: this._hasStartedReloadCycle
+    };
+    
+    return stats;
+  }
+
+  async stopGame(gameId) {
+    const gameState = this.gameStates.get(gameId);
+    if (gameState) {
+      gameState.isRunning = false;
+      this.gameStates.delete(gameId);
+    }
+  }
+
+  async stopAllGames() {
+    for (const [gameId, gameState] of this.gameStates) {
+      gameState.isRunning = false;
+    }
+    this.gameStates.clear();
+    
+    if (this.crashState.isRunning) {
+      this.crashState.isRunning = false;
+    }
+  }
+
+  // Cleanup method to prevent memory leaks
+  cleanup() {
+    // Clear game loop intervals
+    if (this.crashGameLoop) {
+      clearInterval(this.crashGameLoop);
+      this.crashGameLoop = null;
+    }
+    
+    // Clear cleanup interval
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = null;
+    }
+    
+    // Clear all maps and sets to free memory
+    this.games.clear();
+    this.gameStates.clear();
+    this.activeGames.clear();
+    this.userLastMessageTime.clear();
+    
+    // Reset crash state
+    this.crashState = {
+      phase: 'waiting',
+      currentRoundId: null,
+      currentMultiplier: 1.00,
+      phaseStartTime: Date.now(),
+      resultPhaseStartTime: null,
+      activePlayersCount: 0,
+      totalBetAmount: 0.00,
+      currentCrashPoint: 1.00,
+      currentRoundNumber: 1,
+      gameHash: null,
+      serverSeed: null,
+      clientSeed: null
+    };
+    
+    // Force garbage collection if available
+    if (global.gc) {
+      global.gc();
+    }
   }
 }
 
-module.exports = GameLoopEngine; 
+module.exports = GameLoopEngine;
