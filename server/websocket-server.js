@@ -14,6 +14,14 @@ class WebSocketServer {
     this.gameEngine = null; // Will be set by main server
     this.logger = new LoggingService();
     
+    // Rate limiting
+    this.rateLimit = new Map(); // userId -> { count: number, resetTime: number }
+    this.rateLimitConfig = {
+      maxMessages: 10, // Max messages per window
+      windowMs: 10000, // 10 second window
+      resetTime: 60000 // Reset rate limit after 1 minute of no activity
+    };
+    
     // Initialize managers with direct broadcast function
     this.chatManager = new ChatManager(envManager, (gamemode, message) => {
       this.broadcastToRoom(gamemode, message);
@@ -132,9 +140,67 @@ class WebSocketServer {
     }));
   }
 
+  // Check rate limit for user
+  checkRateLimit(userId) {
+    const now = Date.now();
+    const userLimit = this.rateLimit.get(userId);
+    
+    if (!userLimit) {
+      // First message from user
+      this.rateLimit.set(userId, {
+        count: 1,
+        resetTime: now + this.rateLimitConfig.windowMs
+      });
+      return true;
+    }
+    
+    // Check if rate limit window has expired
+    if (now > userLimit.resetTime) {
+      // Reset rate limit
+      this.rateLimit.set(userId, {
+        count: 1,
+        resetTime: now + this.rateLimitConfig.windowMs
+      });
+      return true;
+    }
+    
+    // Check if user has exceeded rate limit
+    if (userLimit.count >= this.rateLimitConfig.maxMessages) {
+      return false;
+    }
+    
+    // Increment message count
+    userLimit.count++;
+    return true;
+  }
+
+  // Clean up old rate limit entries
+  cleanupRateLimit() {
+    const now = Date.now();
+    for (const [userId, limit] of this.rateLimit.entries()) {
+      if (now > limit.resetTime + this.rateLimitConfig.resetTime) {
+        this.rateLimit.delete(userId);
+      }
+    }
+  }
+
   // Handle incoming WebSocket messages
   handleMessage(ws, data) {
     const { type, gamemode, token, ...payload } = data;
+    
+    // Get user ID for rate limiting
+    const connection = this.roomManager.getConnection(ws);
+    const userId = connection?.userData?.id || 'anonymous';
+    
+    // Check rate limit for non-system messages
+    if (type !== 'ping' && type !== 'pong' && !this.checkRateLimit(userId)) {
+      ws.send(JSON.stringify({
+        type: 'error',
+        message: 'Rate limit exceeded. Please wait before sending more messages.',
+        timestamp: new Date().toISOString()
+      }));
+      return;
+    }
 
     switch (type) {
       case 'join_game':
@@ -150,7 +216,6 @@ class WebSocketServer {
         break;
       
       case 'chat_message':
-        const connection = this.roomManager.getConnection(ws);
         this.chatManager.handleChatMessage(ws, payload, connection);
         break;
       
@@ -170,118 +235,142 @@ class WebSocketServer {
     }
   }
 
-
-
   // Handle place bet event
   async handlePlaceBet(ws, payload) {
     try {
-      const { amount, gameId } = payload;
       const connection = this.roomManager.getConnection(ws);
-      
       if (!connection || !connection.gamemode) {
         ws.send(JSON.stringify({
-          type: 'error',
-          message: 'Not in a game room'
+          type: 'not_in_game_room',
+          message: 'Not connected to a game'
         }));
         return;
       }
 
+      const { amount, betType = 'normal' } = payload;
+      if (!amount || amount <= 0) {
+        ws.send(JSON.stringify({
+          type: 'error',
+          message: 'Invalid bet amount'
+        }));
+        return;
+      }
+
+      const username = connection.userData?.username || 'anonymous';
+      this.logger.info(`user ${username} placing bet: ${amount} in ${connection.gamemode}`);
+      
       // Process bet through game engine if available
       if (this.gameEngine) {
         try {
           const userId = connection.userData?.id || 'anonymous';
-          const result = await this.gameEngine.processBet(connection.gamemode, userId, {
-            amount: parseFloat(amount),
-            betType: 'standard'
-          });
+          const gameId = `${connection.gamemode}-main`;
+          const result = await this.gameEngine.processBet(gameId, userId, { amount, betType });
           
           if (result.success) {
-            // Only log successful bets
-            const username = connection.userData?.username || 'anonymous';
-            this.logger.info(`user ${username} placed bet: ${amount} in ${connection.gamemode}`);
-            // Bet was successful
-            // Get updated game state
-            if (connection.gamemode === 'crash') {
-              const userId = connection.userData?.id || 'anonymous';
-              const crashState = await this.gameEngine.getCrashGameState(userId);
-              
-              // Broadcast updated game state
-              this.broadcastToRoom(connection.gamemode, {
-                type: 'game_state_update',
-                gamemode: connection.gamemode,
-                state: crashState,
-                timestamp: new Date().toISOString()
-              });
-            }
-            
-            // Send success confirmation
+            // Send success response - use bet_confirmed to match frontend expectations
             ws.send(JSON.stringify({
               type: 'bet_confirmed',
               amount,
-              gameId,
-              betAmount: amount,
-              message: result.message || 'Bet placed successfully'
+              betType,
+              result,
+              timestamp: new Date().toISOString()
             }));
             
-            // Broadcast bet to room
-            this.broadcastToRoom(connection.gamemode, {
-              type: 'bet_placed',
-              userData: connection.userData,
-              amount,
-              gameId,
-              gamemode: connection.gamemode,
-              timestamp: new Date().toISOString()
-            });
-            
+            // Get updated game state for crash
+            if (connection.gamemode === 'crash') {
+              const userId = connection.userData?.id || 'anonymous';
+              const crashState = await this.gameEngine.getGameState(gameId, userId);
+              
+              // Broadcast updated game state - use crash_state_update for crash
+              this.broadcastToRoom(connection.gamemode, {
+                type: 'crash_state_update',
+                state: crashState,
+                action: 'bet_placed',
+                userData: connection.userData,
+                timestamp: new Date().toISOString()
+              });
+            }
           } else {
-            // Bet failed - send friendly message
+            // Send failure response with proper message
             ws.send(JSON.stringify({
               type: 'bet_failed',
-              message: result.message || 'Bet failed',
-              phase: result.phase,
-              minBet: result.minBet,
-              maxBet: result.maxBet,
-              allowedPhases: result.allowedPhases
+              amount,
+              betType,
+              message: result.message || 'Bet placement failed',
+              timestamp: new Date().toISOString()
             }));
-            return;
           }
           
         } catch (gameError) {
           this.logger.error('game engine error:', gameError);
           ws.send(JSON.stringify({
             type: 'error',
-            message: gameError.message || 'Failed to process bet'
+            message: gameError.message || 'Failed to place bet'
           }));
           return;
         }
       }
       
+      // Broadcast bet to room (only for successful bets)
+      this.broadcastToRoom(connection.gamemode, {
+        type: 'bet_placed',
+        userData: connection.userData,
+        amount,
+        betType,
+        gamemode: connection.gamemode,
+        timestamp: new Date().toISOString()
+      });
+      
     } catch (error) {
-      this.logger.error('error placing bet:', error);
+      this.logger.error('error processing bet:', error);
       ws.send(JSON.stringify({
         type: 'error',
-        message: 'Failed to place bet'
+        message: 'Failed to process bet'
       }));
     }
   }
 
-  // Handle request game state
+  // Handle request game state event
   async handleRequestGameState(ws, payload) {
     try {
       const connection = this.roomManager.getConnection(ws);
       if (!connection || !connection.gamemode) {
         ws.send(JSON.stringify({
-          type: 'error',
-          message: 'Not in a game room'
+          type: 'not_in_game_room',
+          message: 'Not connected to a game'
         }));
         return;
       }
 
-      if (connection.gamemode === 'crash') {
-        await this.sendCurrentGameState(ws);
+      const userId = connection.userData?.id || 'anonymous';
+      const gameId = `${connection.gamemode}-main`;
+      
+      // Get game state from game engine if available
+      if (this.gameEngine) {
+        try {
+          const gameState = await this.gameEngine.getGameState(gameId, userId);
+          
+          // Send appropriate message type based on gamemode
+          const messageType = connection.gamemode === 'crash' ? 'crash_state_update' : 'game_state_update';
+          
+          ws.send(JSON.stringify({
+            type: messageType,
+            gamemode: connection.gamemode,
+            state: gameState,
+            timestamp: new Date().toISOString()
+          }));
+          
+        } catch (gameError) {
+          this.logger.error('game engine error:', gameError);
+          ws.send(JSON.stringify({
+            type: 'error',
+            message: gameError.message || 'Failed to get game state'
+          }));
+        }
       }
+      
     } catch (error) {
-      this.logger.error('error handling game state request:', error);
+      this.logger.error('error getting game state:', error);
       ws.send(JSON.stringify({
         type: 'error',
         message: 'Failed to get game state'
@@ -295,7 +384,7 @@ class WebSocketServer {
       const connection = this.roomManager.getConnection(ws);
       if (!connection || !connection.gamemode) {
         ws.send(JSON.stringify({
-          type: 'error',
+          type: 'not_in_game_room',
           message: 'Not connected to a game'
         }));
         return;
@@ -317,26 +406,39 @@ class WebSocketServer {
       if (this.gameEngine) {
         try {
           const userId = connection.userData?.id || 'anonymous';
-          const result = await this.gameEngine.processGameAction(connection.gamemode, userId, action, targetMultiplier);
+          const gameId = `${connection.gamemode}-main`;
+          const result = await this.gameEngine.processGameAction(gameId, userId, action, { targetMultiplier });
           
           if (result.success) {
-            // Send success response
-            ws.send(JSON.stringify({
+            // Send success response with proper structure for frontend
+            const responseMessage = {
               type: 'game_action_success',
               action,
               result,
               timestamp: new Date().toISOString()
-            }));
+            };
+            
+            // Add cashout-specific properties for frontend compatibility
+            if (action === 'cashout' && result.cashoutValue) {
+              responseMessage.cashoutMultiplier = result.cashoutValue;
+              responseMessage.cashoutAmount = result.cashoutAmount;
+            }
+            
+            // Add auto-cashout-specific properties for frontend compatibility
+            if (action === 'auto_cashout' && result.targetValue) {
+              responseMessage.targetMultiplier = result.targetValue;
+            }
+            
+            ws.send(JSON.stringify(responseMessage));
             
             // Get updated game state for crash
             if (connection.gamemode === 'crash') {
               const userId = connection.userData?.id || 'anonymous';
-              const crashState = await this.gameEngine.getCrashGameState(userId);
+              const crashState = await this.gameEngine.getGameState(gameId, userId);
               
-              // Broadcast updated game state
+              // Broadcast updated game state - use crash_state_update for crash
               this.broadcastToRoom(connection.gamemode, {
-                type: 'game_state_update',
-                gamemode: connection.gamemode,
+                type: 'crash_state_update',
                 state: crashState,
                 action: action,
                 userData: connection.userData,
@@ -381,10 +483,6 @@ class WebSocketServer {
     }
   }
 
-
-
-
-
   // Handle disconnection
   handleDisconnection(ws) {
     try {
@@ -400,101 +498,104 @@ class WebSocketServer {
     }
   }
 
-  // Broadcast message to all users in a gamemode room
+  // Broadcast message to all users in a specific game room
   broadcastToRoom(gamemode, message) {
-    const room = this.roomManager.getRoomUsers(gamemode);
-    if (room && room.size > 0) {
-      const messageStr = JSON.stringify(message);
-      room.forEach(connection => {
-        if (connection.readyState === WebSocket.OPEN) {
-          connection.send(messageStr);
+    if (!this.wss) return;
+    
+    this.wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        const connection = this.roomManager.getConnection(client);
+        if (connection && connection.gamemode === gamemode) {
+          client.send(JSON.stringify(message));
         }
-      });
-    }
+      }
+    });
   }
 
   // Send message to specific user
   sendToUser(userId, message) {
-    // TODO: Implement user-specific messaging
-    this.logger.info(`sending message to user ${userId}:`, message);
+    if (!this.wss) return;
+    
+    this.wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        const connection = this.roomManager.getConnection(client);
+        if (connection && connection.userData && connection.userData.id === userId) {
+          client.send(JSON.stringify(message));
+        }
+      }
+    });
   }
 
-  // Send current game state to specific user
+  // Send current game state to a specific connection
   async sendCurrentGameState(ws) {
-    if (!this.gameEngine) return;
-    
     try {
       const connection = this.roomManager.getConnection(ws);
-      if (connection && connection.userData) {
-        const userId = connection.userData.id || 'anonymous';
-        const crashState = await this.gameEngine.getCrashGameState(userId);
-        const crashHistory = await this.gameEngine.getCrashHistory(20);
-        
-        const message = {
-          type: 'crash_state_update',
-          state: {
-            ...crashState,
-            last_rounds: crashHistory.map(round => ({
-              multiplier: Number(round.crash_multiplier),
-              roundNumber: round.round_number
-            }))
-          },
-          history: crashHistory,
-          timestamp: new Date().toISOString()
-        };
-        
-        ws.send(JSON.stringify(message));
-        // Removed excessive logging - only log errors
+      if (!connection || !connection.gamemode) {
+        return;
       }
+
+      const userId = connection.userData?.id || 'anonymous';
+      const gameId = `${connection.gamemode}-main`;
+      
+      // Get game state from game engine if available
+      if (this.gameEngine) {
+        try {
+          const gameState = await this.gameEngine.getGameState(gameId, userId);
+          
+          // Send appropriate message type based on gamemode
+          const messageType = connection.gamemode === 'crash' ? 'crash_state_update' : 'game_state_update';
+          
+          ws.send(JSON.stringify({
+            type: messageType,
+            gamemode: connection.gamemode,
+            state: gameState,
+            timestamp: new Date().toISOString()
+          }));
+          
+        } catch (gameError) {
+          this.logger.error('game engine error:', gameError);
+          ws.send(JSON.stringify({
+            type: 'error',
+            message: gameError.message || 'Failed to get game state'
+          }));
+        }
+      }
+      
     } catch (error) {
       this.logger.error('error sending current game state:', error);
     }
   }
 
-  // Debug method: Get room statistics
+  // Get room statistics
   getRoomStats() {
-    return this.roomManager.getAllRoomStats();
+    return this.roomManager.getRoomStats();
   }
 
-  // Debug method: Log current room state
+  // Log room state for debugging
   logRoomState() {
-    const stats = this.getRoomStats();
-    this.logger.info('current room state:', JSON.stringify(stats, null, 2));
+    this.roomManager.logRoomState();
   }
 
-  // Broadcast crash state to all users in crash room
+  // Broadcast crash game state to all crash room users
   async broadcastCrashState() {
-    if (!this.gameEngine) return;
-    
-    const crashHistory = await this.gameEngine.getCrashHistory(20);
-    
-    const crashRoom = this.roomManager.getRoomUsers('crash');
-    if (crashRoom && crashRoom.size > 0) {
-      for (const ws of crashRoom) {
-        if (ws.readyState === WebSocket.OPEN) {
-          const connection = this.roomManager.getConnection(ws);
-          if (connection && connection.userData) {
-            // Get state with user's specific bet information
-            const userId = connection.userData.id || 'anonymous';
-            const crashState = await this.gameEngine.getCrashGameState(userId);
-            
-            const message = {
-              type: 'crash_state_update',
-              state: {
-                ...crashState,
-                last_rounds: crashHistory.map(round => ({
-                  multiplier: Number(round.crash_multiplier),
-                  roundNumber: round.round_number
-                }))
-              },
-              history: crashHistory,
-              timestamp: new Date().toISOString()
-            };
-            
-            ws.send(JSON.stringify(message));
-          }
-        }
+    try {
+      if (!this.gameEngine) {
+        return;
       }
+
+      const gameId = 'crash-main';
+      const crashState = await this.gameEngine.getGameState(gameId);
+      
+      if (crashState) {
+        this.broadcastToRoom('crash', {
+          type: 'crash_state_update',
+          state: crashState,
+          timestamp: new Date().toISOString()
+        });
+      }
+      
+    } catch (error) {
+      this.logger.error('error broadcasting crash state:', error);
     }
   }
 
@@ -535,6 +636,9 @@ class WebSocketServer {
       const memUsage = process.memoryUsage();
       const heapUsedMB = Math.round(memUsage.heapUsed / 1024 / 1024);
       const rssMB = Math.round(memUsage.rss / 1024 / 1024);
+      
+      // Clean up rate limit entries
+      this.cleanupRateLimit();
       
       // Log memory usage every 5 minutes
       if (heapUsedMB > 100 || rssMB > 200) {

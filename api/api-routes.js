@@ -235,11 +235,12 @@ router.post('/crash/bet', validateToken, async (req, res) => {
       return res.status(403).json({ error: 'You are banned from placing bets' });
     }
 
-    // Use the crash bet function
-    const result = await dbService.supabase.rpc('place_crash_bet', {
-      p_round_id: 1, // This should be the current round ID
+    // Use the generic bet function
+    const result = await dbService.supabase.rpc('place_bet', {
+      p_game_type: 'crash',
+      p_user_id: userProfile.id,
       p_bet_amount: betAmount,
-      p_user_id: userProfile.id
+      p_round_id: 1 // This should be the current round ID
     });
 
     if (result.error) {
@@ -276,14 +277,17 @@ router.post('/crash/cashout', validateToken, async (req, res) => {
     }
 
     // Get current multiplier from game state
-    const gameState = await dbService.supabase.rpc('get_crash_game_state');
+    const gameState = await dbService.supabase.rpc('get_game_state', {
+      p_game_type: 'crash'
+    });
     const currentMultiplier = gameState.data.current_multiplier;
 
-    // Use the cashout function
-    const result = await dbService.supabase.rpc('cashout_crash_bet', {
-      p_round_id: roundId,
+    // Use the generic cashout function
+    const result = await dbService.supabase.rpc('cashout_bet', {
+      p_game_type: 'crash',
       p_user_id: userProfile.id,
-      p_cashout_multiplier: currentMultiplier
+      p_round_id: roundId,
+      p_cashout_value: currentMultiplier
     });
 
     if (result.error) {
@@ -307,7 +311,9 @@ router.get('/crash/state', validateToken, async (req, res) => {
     const dbService = new DatabaseService();
     await dbService.initialize();
     
-    const result = await dbService.supabase.rpc('get_crash_game_state');
+    const result = await dbService.supabase.rpc('get_game_state', {
+      p_game_type: 'crash'
+    });
     
     if (result.error) {
       return res.status(500).json({ error: result.error.message });
@@ -329,9 +335,27 @@ router.post('/crash/new-round', validateToken, async (req, res) => {
     const dbService = new DatabaseService();
     await dbService.initialize();
     
-    const result = await dbService.supabase.rpc('create_crash_round', {
-      p_server_seed: serverSeed || crypto.randomBytes(32).toString('hex'),
-      p_client_seed: clientSeed || 'default'
+    // Generate crash multiplier
+    const crypto = require('crypto');
+    const finalServerSeed = serverSeed || crypto.randomBytes(32).toString('hex');
+    const finalClientSeed = clientSeed || 'default';
+    
+    // Create game data for the round
+    const gameData = {
+      phase: 'betting',
+      crash_multiplier: 1.00, // Will be calculated by the game
+      game_hash: crypto.createHash('sha256').update(finalServerSeed + finalClientSeed).digest('hex'),
+      server_seed: finalServerSeed,
+      client_seed: finalClientSeed,
+      current_multiplier: 1.00,
+      active_players_count: 0,
+      total_bet_amount: 0.00,
+      phase_start_time: new Date().toISOString()
+    };
+    
+    const result = await dbService.supabase.rpc('create_game_round', {
+      p_game_type: 'crash',
+      p_game_data: gameData
     });
     
     if (result.error) {
@@ -581,6 +605,82 @@ router.get('/chat-settings', async (req, res) => {
   } catch (error) {
     console.error('Error getting chat settings:', error);
     res.status(500).json({ error: 'Failed to get chat settings' });
+  }
+});
+
+// GET /api/game/:gameId/state - Get current game state
+router.get('/game/:gameId/state', validateToken, async (req, res) => {
+  try {
+    const { gameId } = req.params;
+    const { userId } = req.query;
+    
+    const gameEngine = req.gameEngine;
+    if (!gameEngine) {
+      return res.status(500).json({ error: 'Game engine not available' });
+    }
+    
+    const gameState = await gameEngine.getGameState(gameId, userId);
+    
+    if (!gameState) {
+      return res.status(404).json({ error: 'Game not found' });
+    }
+    
+    res.json(gameState);
+  } catch (error) {
+    await logger.error('error getting game state', { error: error.message });
+    res.status(500).json({ error: 'Failed to get game state' });
+  }
+});
+
+// GET /api/game/:gameId/history - Get game history
+router.get('/game/:gameId/history', validateToken, async (req, res) => {
+  try {
+    const { gameId } = req.params;
+    const { limit = 20 } = req.query;
+    
+    const gameEngine = req.gameEngine;
+    if (!gameEngine) {
+      return res.status(500).json({ error: 'Game engine not available' });
+    }
+    
+    const history = await gameEngine.getGameHistory(gameId, parseInt(limit));
+    
+    res.json(history);
+  } catch (error) {
+    await logger.error('error getting game history', { error: error.message });
+    res.status(500).json({ error: 'Failed to get game history' });
+  }
+});
+
+// GET /api/stats/memory - Get memory statistics (Admin only)
+router.get('/stats/memory', validateToken, validateAdmin, async (req, res) => {
+  try {
+    const gameEngine = req.gameEngine;
+    if (!gameEngine) {
+      return res.status(500).json({ error: 'Game engine not available' });
+    }
+    
+    const stats = gameEngine.getMemoryStats();
+    res.json(stats);
+  } catch (error) {
+    await logger.error('error getting memory stats', { error: error.message });
+    res.status(500).json({ error: 'Failed to get memory stats' });
+  }
+});
+
+// GET /api/stats/active-games - Get active games (Admin only)
+router.get('/stats/active-games', validateToken, validateAdmin, async (req, res) => {
+  try {
+    const gameEngine = req.gameEngine;
+    if (!gameEngine) {
+      return res.status(500).json({ error: 'Game engine not available' });
+    }
+    
+    const activeGames = gameEngine.getActiveGames();
+    res.json({ activeGames });
+  } catch (error) {
+    await logger.error('error getting active games', { error: error.message });
+    res.status(500).json({ error: 'Failed to get active games' });
   }
 });
 

@@ -61,6 +61,75 @@ class GameConfig {
     return this.config.balanceLimits;
   }
 
+  // Validate configuration values
+  validateConfig(config) {
+    const errors = [];
+    
+    // Validate bet limits
+    if (config.betLimits) {
+      for (const [gamemode, limits] of Object.entries(config.betLimits)) {
+        if (limits.min < 0) {
+          errors.push(`${gamemode}: Minimum bet cannot be negative`);
+        }
+        if (limits.max <= 0) {
+          errors.push(`${gamemode}: Maximum bet must be positive`);
+        }
+        if (limits.min >= limits.max) {
+          errors.push(`${gamemode}: Minimum bet must be less than maximum bet`);
+        }
+      }
+    }
+    
+    // Validate house edge
+    if (config.houseEdge) {
+      for (const [gamemode, edge] of Object.entries(config.houseEdge)) {
+        if (edge < 0 || edge > 1) {
+          errors.push(`${gamemode}: House edge must be between 0 and 1`);
+        }
+      }
+    }
+    
+    // Validate game timing
+    if (config.gameTiming) {
+      for (const [phase, duration] of Object.entries(config.gameTiming)) {
+        if (duration < 0) {
+          errors.push(`${phase}: Duration cannot be negative`);
+        }
+      }
+    }
+    
+    // Validate chat settings
+    if (config.chatSettings) {
+      if (config.chatSettings.messageRateLimit < 100) {
+        errors.push('Message rate limit must be at least 100ms');
+      }
+      if (config.chatSettings.maxMessageLength < 1) {
+        errors.push('Maximum message length must be at least 1 character');
+      }
+      if (config.chatSettings.maxHistoryLength < 1) {
+        errors.push('Maximum history length must be at least 1 message');
+      }
+    }
+    
+    // Validate balance limits
+    if (config.balanceLimits) {
+      if (config.balanceLimits.minBalance < 0) {
+        errors.push('Minimum balance cannot be negative');
+      }
+      if (config.balanceLimits.maxBalance <= 0) {
+        errors.push('Maximum balance must be positive');
+      }
+      if (config.balanceLimits.minBalance >= config.balanceLimits.maxBalance) {
+        errors.push('Minimum balance must be less than maximum balance');
+      }
+    }
+    
+    return {
+      valid: errors.length === 0,
+      errors: errors
+    };
+  }
+
   // Update configuration from database (internal method, no save)
   _updateConfigFromDatabase(newConfig) {
     // Validate new configuration

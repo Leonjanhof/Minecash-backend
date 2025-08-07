@@ -12,7 +12,7 @@ const helmet = require('helmet');
 // Import our modules
 const WebSocketServer = require('./websocket-server');
 const EnvManager = require('../config/env-manager');
-const GameLoopEngine = require('./game-loop-engine');
+const GameEngine = require('./core/game-engine');
 const DatabaseService = require('./database-service');
 const LoggingService = require('./logging-service');
 
@@ -37,9 +37,10 @@ class MineCashServer {
       await this.dbService.initialize();
       await this.logger.success('database service initialized');
       
-      // Initialize game loop engine
-      this.gameEngine = new GameLoopEngine(this.dbService);
-      await this.logger.success('game loop engine initialized');
+      // Initialize game engine with proper architecture
+      this.gameEngine = new GameEngine(this.dbService);
+      await this.gameEngine.initialize();
+      await this.logger.success('game engine initialized');
       
       // Setup Express middleware
       this.setupMiddleware();
@@ -91,6 +92,16 @@ class MineCashServer {
   }
 
   setupRoutes() {
+    // Add game engine to request object for API routes
+    this.app.use((req, res, next) => {
+      req.gameEngine = this.gameEngine;
+      next();
+    });
+
+    // API routes
+    const apiRoutes = require('../api/api-routes');
+    this.app.use('/api', apiRoutes);
+
     // Health check endpoint
     this.app.get('/health', (req, res) => {
       const healthData = { 
@@ -99,102 +110,108 @@ class MineCashServer {
         version: '1.0.0'
       };
       
-      // Add memory stats if game engine is available
-      if (this.gameEngine) {
-        healthData.memory = this.gameEngine.getMemoryStats();
-      }
-      
       res.json(healthData);
     });
 
-    // Memory monitoring endpoint
-    this.app.get('/memory', (req, res) => {
-      if (this.gameEngine) {
-        const memoryStats = this.gameEngine.getMemoryStats();
-        console.log('Memory stats being sent:', memoryStats); // Debug log
-        res.json({
-          memory: memoryStats,
-          timestamp: new Date().toISOString()
-        });
-      } else {
-        console.log('Game engine not available for memory stats');
-        res.status(503).json({ error: 'Game engine not available' });
+    // Game config endpoint
+    this.app.get('/api/config/:gameType', (req, res) => {
+      try {
+        const { gameType } = req.params;
+        const config = this.gameEngine.getGameConfig(gameType);
+        res.json(config);
+      } catch (error) {
+        res.status(500).json({ error: 'Failed to get game config' });
       }
     });
 
-    // API routes with game engine instance
-    const apiRoutes = require('../api/api-routes');
-    this.app.use('/api', (req, res, next) => {
-      req.gameEngine = this.gameEngine;
-      next();
-    }, apiRoutes);
+    // Game engine health check endpoint (internal monitoring)
+    this.app.get('/health/game-engine', (req, res) => {
+      try {
+        const health = {
+          status: 'healthy',
+          timestamp: new Date().toISOString(),
+          games: this.gameEngine.getActiveGames(),
+          memory: this.gameEngine.getMemoryStats(),
+          uptime: process.uptime()
+        };
+        res.json(health);
+      } catch (error) {
+        res.status(500).json({ 
+          status: 'unhealthy',
+          error: 'Game engine health check failed',
+          timestamp: new Date().toISOString()
+        });
+      }
+    });
   }
 
   async startServer() {
-    const apiConfig = this.envManager.getApiConfig();
-    const wsConfig = this.envManager.getWebSocketConfig();
-    
-    // Start HTTP/API server
-    this.server.listen(apiConfig.port, apiConfig.host, async () => {
-      await this.logger.info(`api server running on http://${apiConfig.host}:${apiConfig.port}`);
-      await this.logger.info(`environment: ${this.envManager.getMode()}`);
-      await this.logger.info(`debug mode: ${this.envManager.isDevelopment()}`);
-    });
-    
-    // For production hosting, run WebSocket on same port as HTTP server
-    if (this.envManager.isProduction()) {
-      // Initialize WebSocket server on the same HTTP server
-      await this.wsServer.initialize(this.server, this.gameEngine);
-      await this.logger.success('websocket server initialized on same port as api server');
-    } else {
-      // Development: Use separate port for WebSocket
-      this.wsHttpServer.listen(wsConfig.port, wsConfig.host, async () => {
-        await this.logger.info(`webSocket server running on ws://${wsConfig.host}:${wsConfig.port}`);
+    try {
+      // Start API server
+      const apiConfig = this.envManager.getApiConfig();
+      this.server.listen(apiConfig.port, apiConfig.host, () => {
+        console.log(`API server running on ${apiConfig.host}:${apiConfig.port}`);
       });
+      
+      // Start WebSocket server
+      const wsConfig = this.envManager.getWebSocketConfig();
+      this.wsHttpServer.listen(wsConfig.port, wsConfig.host, () => {
+        console.log(`WebSocket server running on ${wsConfig.host}:${wsConfig.port}`);
+      });
+      
+      // Set global server instance for WebSocket access
+      global.serverInstance = this;
+      
+    } catch (error) {
+      await this.logger.error('failed to start servers', { error: error.message });
+      throw error;
     }
   }
 
   async shutdown() {
-    await this.logger.info('shutting down mineCash backend server...');
-    
-    if (this.wsServer) {
-      await this.wsServer.shutdown();
+    try {
+      await this.logger.info('shutting down mineCash backend server...');
+      
+      // Cleanup game engine
+      if (this.gameEngine) {
+        await this.gameEngine.cleanup();
+      }
+      
+      // Close servers
+      if (this.server) {
+        this.server.close();
+      }
+      
+      if (this.wsHttpServer) {
+        this.wsHttpServer.close();
+      }
+      
+      await this.logger.success('mineCash backend server shutdown completed');
+      
+    } catch (error) {
+      await this.logger.error('error during shutdown', { error: error.message });
     }
-    
-    if (this.gameEngine) {
-      this.gameEngine.cleanup();
-    }
-    
-    if (this.server) {
-      this.server.close();
-    }
-    
-    if (this.wsHttpServer) {
-      this.wsHttpServer.close();
-    }
-    
-    await this.logger.info('server shutdown complete');
-    process.exit(0);
   }
 }
 
+// Create and start server
+const server = new MineCashServer();
+
 // Handle graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('sigterm received, shutting down gracefully');
-  server.shutdown();
+process.on('SIGINT', async () => {
+  console.log('\nReceived SIGINT, shutting down gracefully...');
+  await server.shutdown();
+  process.exit(0);
 });
 
-process.on('SIGINT', () => {
-  console.log('sigint received, shutting down gracefully');
-  server.shutdown();
+process.on('SIGTERM', async () => {
+  console.log('\nReceived SIGTERM, shutting down gracefully...');
+  await server.shutdown();
+  process.exit(0);
 });
 
 // Start the server
-const server = new MineCashServer();
-global.serverInstance = server; // Store instance globally for emergency stop
 server.initialize().catch((error) => {
   console.error('Failed to start server:', error);
   process.exit(1);
-});
-
-module.exports = MineCashServer; 
+}); 
