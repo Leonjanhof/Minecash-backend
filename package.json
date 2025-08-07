@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "MineCash Casino Backend System - Real-time gaming with WebSockets",
   "main": "server/index.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "scripts": {
     "start": "node server/index.js",
     "dev": "nodemon server/index.js",

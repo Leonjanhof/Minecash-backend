@@ -1,7 +1,7 @@
 // Game Engine - Main orchestrator for all game types
 // Purpose: Manage game instances, handle routing, and provide unified interface
 
-const LoggingService = require('../services/logging-service');
+const LoggingService = require('../logging-service');
 const ConfigManager = require('./config-manager');
 const MemoryManager = require('./memory-manager');
 const EventBus = require('./event-bus');
